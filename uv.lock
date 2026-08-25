@@ -1468,6 +1468,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "ipykernel" },
+    { name = "keras" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "pandas" },
@@ -1480,6 +1481,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "ipykernel", specifier = ">=7.3.0" },
+    { name = "keras", specifier = ">=3.15.1" },
     { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "numpy", specifier = ">=2.5.2" },
     { name = "pandas", specifier = ">=3.0.5" },
