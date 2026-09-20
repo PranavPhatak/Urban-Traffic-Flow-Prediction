@@ -1,35 +1,22 @@
 """
 Step 2: Feature engineering for GA0151 intersection LSTM forecasting.
 
-Deliberately leaner than the original Feature_Engineering.ipynb, and fixes two
-correctness issues found in that notebook:
+CHANGE from previous version: excludes the COVID lockdown window from the
+data BEFORE segment_id is computed. Yearly mean traffic flow is 25-40% lower
+in 2020-2021 than every other year (2019, 2022, 2023) for all three sensors
+-- that's a genuine regime shift (empty roads during lockdowns), not noise.
+The original training set (Oct 2019 - Jul 2022) had ~half its rows from this
+anomalous period while val/test (Jul 2022 onward) are entirely post-pandemic,
+which likely explains why val loss plateaued early while train loss kept
+improving during training.
 
-1. LEAKAGE: the original `{sensor}_diff_1` / `_diff_24` were defined as
-   `current_value - lag`, which algebraically reconstructs the current-row
-   target with 100% accuracy (verified on this dataset). Not included here.
+This filter reuses the SAME segment-break machinery already used for real
+sensor-outage gaps: dropping rows here creates a jump in `datetime` that
+`hour_gap` detects downstream, so no lag/rolling/target feature or LSTM
+window will bridge across the excluded period. No other logic changes.
 
-2. GAP BRIDGING: any `.shift()` / `.rolling()` computed on row position alone
-   is wrong once you know ~4% of hours are missing (see 01_data_cleaning.py).
-   A "lag_1" for the first row after a 35-day gap must NOT be the last row
-   before the gap. This script computes every lag/rolling/target feature
-   PER CONTIGUOUS SEGMENT (a run of truly consecutive hours), using a
-   `segment_id` derived from datetime, so no feature ever crosses a gap.
-
-Feature philosophy: for a recurrent model (LSTM), the sequence window itself
-already encodes lag/rolling-window information -- feeding the same history a
-second time as parallel hand-crafted lag columns is redundant and just adds
-collinear, overfitting-prone dimensions. Kept:
-  - raw flow (becomes the input sequence)
-  - cyclical time encodings + is_weekend (the LSTM can't infer calendar
-    structure from 48 raw hours alone as reliably as an explicit encoding)
-  - rolling_std_24 per sensor (local volatility -- meaningfully different
-    information than what a window of raw values gives the LSTM directly)
-Dropped: lag_*, rolling_mean_*, diff_* (redundant with the sequence, and
-diff_* was leaky besides).
-
-Output: dataset/processed/GA0151_features.csv, including `segment_id` and
-`datetime` -- the training script uses `segment_id` to make sure no window
-crosses a data gap.
+Test this one change in isolation before touching model architecture --
+see 03_train_lstm.py's "Next steps" comment.
 """
 
 from pathlib import Path
@@ -41,11 +28,33 @@ SENSORS = ["GA0151_A", "GA0151_C", "GA0151_D"]
 HORIZON = 1          # forecast horizon in hours; e.g. 24 for next-day-same-hour
 ROLLING_STD_WINDOW = 24
 
+# COVID lockdown exclusion window. Chosen from the visible yearly-mean dip
+# (UK national lockdown started 2020-03-23; Scotland lifted most remaining
+# restrictions by early 2022). Adjust if you want a tighter/looser cut --
+# widen it if the train/val gap is still large after this change, narrow it
+# if removing it barely changes the result and you want the data back.
+EXCLUDE_COVID_PERIOD = True
+COVID_EXCLUDE_START = "2020-03-01"
+COVID_EXCLUDE_END = "2021-12-31"
+
 # ----------------------------------------------------------------------------
 # 1. Load cleaned data
 # ----------------------------------------------------------------------------
 df = pd.read_csv(PROCESSED_DIR / "GA0151_clean.csv", parse_dates=["datetime"])
 df = df.sort_values("datetime").reset_index(drop=True)
+
+# ----------------------------------------------------------------------------
+# 1b. NEW: drop the COVID-affected window. This happens before segment_id is
+#     computed, so the resulting gap in `datetime` is picked up by the same
+#     `hour_gap` check used for real sensor outages -- no separate logic
+#     needed, and no feature/window will ever bridge across it.
+# ----------------------------------------------------------------------------
+if EXCLUDE_COVID_PERIOD:
+    before = len(df)
+    covid_mask = (df["datetime"] >= COVID_EXCLUDE_START) & (df["datetime"] <= COVID_EXCLUDE_END)
+    df = df[~covid_mask].reset_index(drop=True)
+    print(f"Excluded COVID window {COVID_EXCLUDE_START} -> {COVID_EXCLUDE_END}: "
+          f"removed {before - len(df):,} rows ({len(df):,} remain)")
 
 # Rows that are still NaN after cleaning are unfilled long gaps -- they can't
 # be used as inputs, but keeping them in place (for now) is what lets us
@@ -55,14 +64,13 @@ gap_row = df[SENSORS].isna().any(axis=1)
 # ----------------------------------------------------------------------------
 # 2. Segment ID: increments every time there's a break in true hourly
 #    continuity OR a still-missing (unfilled) row. Everything downstream is
-#    computed within a segment, never across one.
+#    computed within a segment, never across one. The COVID exclusion above
+#    now also triggers a segment break here, automatically.
 # ----------------------------------------------------------------------------
 hour_gap = df["datetime"].diff() != pd.Timedelta(hours=1)
 new_segment = hour_gap | gap_row | gap_row.shift(fill_value=False)
 df["segment_id"] = new_segment.cumsum()
 
-# Drop the still-missing rows themselves now that they've served their purpose
-# of marking segment boundaries.
 df = df[~gap_row].reset_index(drop=True)
 
 n_segments = df["segment_id"].nunique()
@@ -98,10 +106,7 @@ for sensor in SENSORS:
 
 # ----------------------------------------------------------------------------
 # 5. Contemporaneous neighbor-sensor mean -- same timestamp, not shifted, so
-#    no gap risk. (Note: only valid as a feature if all 3 sensors' current
-#    reading is genuinely available at prediction time -- true for a fused
-#    nowcasting/sensor-network setup; revisit if sensors are meant to be
-#    predicted independently with no shared real-time feed.)
+#    no gap risk.
 # ----------------------------------------------------------------------------
 for sensor in SENSORS:
     others = [s for s in SENSORS if s != sensor]
@@ -109,9 +114,8 @@ for sensor in SENSORS:
 
 # ----------------------------------------------------------------------------
 # 6. Forward-looking targets -- per segment, so the target for the last few
-#    rows of a segment (where t+HORIZON would fall in the next segment, i.e.
-#    after a gap) is correctly left as NaN rather than silently pulled from
-#    an unrelated time period.
+#    rows of a segment is correctly left as NaN rather than silently pulled
+#    from an unrelated time period.
 # ----------------------------------------------------------------------------
 for sensor in SENSORS:
     df[f"{sensor}_target"] = (

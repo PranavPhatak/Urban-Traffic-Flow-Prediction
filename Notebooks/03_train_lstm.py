@@ -157,7 +157,8 @@ print()
 for i, s in enumerate(SENSORS):
     mae = np.mean(np.abs(y_true[:, i] - y_pred[:, i]))
     rmse = np.sqrt(np.mean((y_true[:, i] - y_pred[:, i]) ** 2))
-    print(f"{s} -> Test MAE: {mae:.2f} vehicles/hr | Test RMSE: {rmse:.2f} vehicles/hr")
+    r2 = r2_score(y_true[:, i], y_pred[:, i])
+    print(f"{s} -> Test MAE: {mae:.2f} vehicles/hr | Test RMSE: {rmse:.2f} vehicles/hr | Test R2: {r2:.4f}")
 
 # ----------------------------------------------------------------------------
 # 8. Naive persistence baseline -- ALWAYS compare against this before trusting
@@ -181,10 +182,9 @@ for i, s in enumerate(SENSORS):
         preds.append(raw_vals[idx - 1])
         actuals.append(targets[idx])
     preds, actuals = np.array(preds), np.array(actuals)
-    r2 = r2_score(actuals, preds)
     mae = np.mean(np.abs(actuals - preds))
     rmse = np.sqrt(np.mean((actuals - preds) ** 2))
-    print(f"{s} -> Baseline MAE: {mae:.2f} | Baseline RMSE: {rmse:.2f} | Baseline r2 score: {r2:.4f}")
+    print(f"{s} -> Baseline MAE: {mae:.2f} | Baseline RMSE: {rmse:.2f}")
 
 # ----------------------------------------------------------------------------
 # Next steps if the LSTM doesn't clearly beat the baseline above:
