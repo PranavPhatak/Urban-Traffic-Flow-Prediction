@@ -34,9 +34,9 @@ PROCESSED_DIR = Path("../dataset/processed")
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 SENSOR_FILES = {
-    "GA0151_A": "GA0151_A.csv",
-    "GA0151_C": "GA0151_C.csv",
-    "GA0151_D": "GA0151_D.csv",
+    "GD0151_B": "Gd0151_B.csv",
+    "GD0151_C": "GD0151_C.csv",
+    "GD0151_D": "GD0151_D.csv",
 }
 MAX_INTERPOLATE_HOURS = 3   # only bridge gaps this short or shorter
 FLAT_RUN_FLAG_HOURS = 6     # flag identical-value runs at least this long

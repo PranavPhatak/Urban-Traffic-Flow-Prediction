@@ -23,8 +23,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-PROCESSED_DIR = Path("dataset/processed")
-SENSORS = ["GA0151_A", "GA0151_C", "GA0151_D"]
+PROCESSED_DIR = Path("../dataset/processed")
+SENSORS = ["GD0151_B", "GD0151_C", "GD0151_D"]
 HORIZON = 1          # forecast horizon in hours; e.g. 24 for next-day-same-hour
 ROLLING_STD_WINDOW = 24
 
