@@ -54,7 +54,7 @@ LOG_TRANSFORM_FLOW = True
 # ----------------------------------------------------------------------------
 # 1. Load cleaned data
 # ----------------------------------------------------------------------------
-df = pd.read_csv(PROCESSED_DIR / "GA0151_clean.csv", parse_dates=["datetime"])
+df = pd.read_csv(PROCESSED_DIR / "GD0501_clean.csv", parse_dates=["datetime"])
 df = df.sort_values("datetime").reset_index(drop=True)
 
 # ----------------------------------------------------------------------------
@@ -164,7 +164,7 @@ TARGET_COLS = [f"{s}_target" for s in SENSORS]
 KEEP_COLS = ["datetime", "segment_id"] + FEATURE_COLS + TARGET_COLS
 df = df[KEEP_COLS]
 
-output_path = PROCESSED_DIR / "GA0151_features.csv"
+output_path = PROCESSED_DIR / "GD0501_features.csv"
 df.to_csv(output_path, index=False)
 
 print(f"\nSaved -> {output_path}")

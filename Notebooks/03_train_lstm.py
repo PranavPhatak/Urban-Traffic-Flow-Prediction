@@ -1,9 +1,9 @@
 """
-Step 3: Multi-output LSTM for GA0151 intersection traffic-flow forecasting.
+Step 3: Multi-output LSTM for GD0501 intersection traffic-flow forecasting.
 
 Reads dataset/processed/GA0151_features.csv (output of 02_feature_engineering.py).
-Predicts sensors A, C, D jointly (one model, 3 outputs) since they're the same
-intersection and correlated.
+Predicts sensors GD0501_B, GD0501_C, GD0501_D jointly (one model, 3 outputs)
+since they're the same intersection and correlated.
 
 Key correctness points carried over from cleaning/feature-engineering:
 - `segment_id` marks contiguous true-hourly runs. Sequence windows are only
@@ -11,6 +11,26 @@ Key correctness points carried over from cleaning/feature-engineering:
   a data gap (the longest gap in this dataset is 35 days).
 - Chronological split (train / val / test by date), not random.
 - Scaler fit on train only.
+
+FIXED in this version (the reason the baseline looked "too low"):
+- OFF-BY-ONE in window construction. In 02_feature_engineering.py, row i holds
+  the flow at hour t_i and `<sensor>_target` on that row is the flow at
+  t_i + HORIZON. The old make_sequences() fed rows [i-WINDOW, i) as input but
+  used targets[i] as the label -- so the newest hour the model was allowed to
+  see was t_{i-1} while the label was t_i + 1: a 2-HOUR-ahead forecast, not the
+  1-hour horizon the config says. The persistence baseline (raw_vals[idx-1])
+  had the same 2-hour gap, so it was being scored on a harder task than
+  intended, which is why its R2 (0.47-0.59) sat far below what lag-1
+  autocorrelation of 0.84-0.89 implies (R2 ~ 0.7-0.8).
+  Now the window is rows [i-WINDOW+1, i] (INCLUDING row i, the latest known
+  hour) and the label is targets[i] -> a true HORIZON-hour-ahead forecast.
+- The baseline is now evaluated on EXACTLY the same test windows as the LSTM
+  (previously it used a looser filter and a different sample set).
+- Added a seasonal-naive baseline (same hour yesterday). Traffic has a strong
+  daily cycle, and persistence ignores it while the LSTM gets hour/day/month
+  features, so persistence alone is a weak yardstick.
+- Added sanity checks that fail loudly if targets, windows or the scaler
+  inversion are misaligned.
 """
 
 from pathlib import Path
@@ -27,26 +47,59 @@ from tensorflow.keras import layers, models, callbacks
 # ----------------------------------------------------------------------------
 PROCESSED_DIR = Path("../dataset/processed")
 SENSORS = ["GD0501_B", "GD0501_C", "GD0501_D"]
+HORIZON = 1          # hours ahead. MUST equal HORIZON in 02_feature_engineering.py
 WINDOW = 48          # hours of history fed to the LSTM per prediction
+SEASONAL_LAG = 24    # "same hour yesterday" baseline
 VAL_FRAC = 0.15
 TEST_FRAC = 0.15
 BATCH_SIZE = 64
 EPOCHS = 100
 SEED = 42
 
-tf.random.set_seed(SEED)
-np.random.seed(SEED)
+assert HORIZON < SEASONAL_LAG, "seasonal baseline needs HORIZON < SEASONAL_LAG"
+assert SEASONAL_LAG - HORIZON <= WINDOW - 1, "WINDOW too short for the seasonal baseline"
+
+tf.keras.utils.set_random_seed(SEED)   # seeds python, numpy and tensorflow
 
 # ----------------------------------------------------------------------------
 # 1. Load engineered features
 # ----------------------------------------------------------------------------
-df = pd.read_csv(PROCESSED_DIR / "GA0151_features.csv", parse_dates=["datetime"])
+df = pd.read_csv(PROCESSED_DIR / "GD0501_features.csv", parse_dates=["datetime"])
 df = df.sort_values("datetime").reset_index(drop=True)
 
 FEATURE_COLS = [c for c in df.columns if c not in ("datetime", "segment_id") and not c.endswith("_target")]
 TARGET_COLS = [f"{s}_target" for s in SENSORS]
 
 print(f"Loaded {len(df):,} rows, {len(FEATURE_COLS)} features, {df['segment_id'].nunique()} segments")
+
+
+def check_target_alignment(frame, horizon):
+    """Verify 02's `<sensor>_target` really is the flow `horizon` hours later.
+
+    For rows i and i+horizon that are in the same segment and exactly
+    `horizon` hours apart, target[i] must equal sensor[i+horizon].
+    """
+    dt = frame["datetime"].to_numpy()
+    seg = frame["segment_id"].to_numpy()
+    ok = np.where(
+        (seg[horizon:] == seg[:-horizon])
+        & ((dt[horizon:] - dt[:-horizon]) == np.timedelta64(horizon, "h"))
+    )[0]
+    if len(ok) == 0:
+        raise ValueError("No row pairs available to verify target alignment")
+    for s in SENSORS:
+        tgt_now = frame[f"{s}_target"].to_numpy()[ok]
+        val_later = frame[s].to_numpy()[ok + horizon]
+        if not np.allclose(tgt_now, val_later):
+            raise ValueError(
+                f"{s}_target is not the flow {horizon}h ahead -- is HORIZON here "
+                f"the same as in 02_feature_engineering.py?"
+            )
+    print(f"Target alignment OK: <sensor>_target == flow {horizon}h ahead "
+          f"({len(ok):,} row pairs checked)")
+
+
+check_target_alignment(df, HORIZON)
 
 # ----------------------------------------------------------------------------
 # 2. Chronological split by TIME, never randomly shuffled
@@ -63,6 +116,11 @@ print(f"Train: {train_df['datetime'].min()} -> {train_df['datetime'].max()}  ({l
 print(f"Val:   {val_df['datetime'].min()} -> {val_df['datetime'].max()}  ({len(val_df)} rows)")
 print(f"Test:  {test_df['datetime'].min()} -> {test_df['datetime'].max()}  ({len(test_df)} rows)")
 
+# Keep an UNSCALED copy of the test split (log1p space, as written by step 02).
+# Baselines and the ground truth are taken from this, so they never depend on
+# the scaler.
+test_raw = test_df.reset_index(drop=True)
+
 # ----------------------------------------------------------------------------
 # 3. Scale -- fit ONLY on train
 # ----------------------------------------------------------------------------
@@ -74,27 +132,42 @@ for split_df in (train_df, val_df, test_df):
     split_df[TARGET_COLS] = target_scaler.transform(split_df[TARGET_COLS])
 
 # ----------------------------------------------------------------------------
-# 4. Windowing -- segment-aware. A window of WINDOW rows is only kept if every
-#    row in it (and its target row) shares the same segment_id, i.e. is truly
-#    contiguous hourly data with no gap stitched in.
+# 4. Windowing -- segment-aware and correctly aligned.
+#
+#    A sample ends at row e:
+#        input  = feature rows [e-WINDOW+1 ... e]   (INCLUDES row e, the latest
+#                                                    hour we know about)
+#        label  = targets[e]                        (flow at t_e + HORIZON)
+#
+#    The window is kept only if all its rows share one segment_id AND span
+#    exactly WINDOW-1 hours, i.e. it is truly contiguous hourly data. The
+#    label row is guaranteed to be in the same segment: step 02 dropped every
+#    row whose target crossed a segment boundary.
 # ----------------------------------------------------------------------------
 def make_sequences(split_df, window):
-    X_seq, y_seq = [], []
-    feats = split_df[FEATURE_COLS].to_numpy()
-    targets = split_df[TARGET_COLS].to_numpy()
+    feats = split_df[FEATURE_COLS].to_numpy(dtype=np.float32)
+    targets = split_df[TARGET_COLS].to_numpy(dtype=np.float32)
     seg_ids = split_df["segment_id"].to_numpy()
+    times = split_df["datetime"].to_numpy()
 
-    for i in range(window, len(split_df)):
-        window_segs = seg_ids[i - window:i + 1]  # includes the target row
-        if len(set(window_segs)) != 1:
-            continue  # window would cross a gap -- skip it
-        X_seq.append(feats[i - window:i])
-        y_seq.append(targets[i])
-    return np.array(X_seq), np.array(y_seq)
+    end_idx = np.arange(window - 1, len(split_df))
+    start_idx = end_idx - (window - 1)
 
-X_train_seq, y_train_seq = make_sequences(train_df, WINDOW)
-X_val_seq, y_val_seq = make_sequences(val_df, WINDOW)
-X_test_seq, y_test_seq = make_sequences(test_df, WINDOW)
+    same_segment = seg_ids[start_idx] == seg_ids[end_idx]
+    contiguous = (times[end_idx] - times[start_idx]) == np.timedelta64(window - 1, "h")
+    end_idx = end_idx[same_segment & contiguous]
+
+    if len(end_idx) == 0:
+        raise ValueError("No valid windows in this split -- reduce WINDOW or change the split")
+
+    X = np.stack([feats[e - window + 1:e + 1] for e in end_idx])
+    y = targets[end_idx]
+    return X, y, end_idx
+
+
+X_train_seq, y_train_seq, _ = make_sequences(train_df, WINDOW)
+X_val_seq, y_val_seq, _ = make_sequences(val_df, WINDOW)
+X_test_seq, y_test_seq, test_end = make_sequences(test_df, WINDOW)
 
 print(f"\nSequence shapes -> train: {X_train_seq.shape}, val: {X_val_seq.shape}, test: {X_test_seq.shape}")
 
@@ -109,8 +182,7 @@ n_outputs = len(TARGET_COLS)
 def build_model(window, n_features, n_outputs, sensor_names):
     inputs = layers.Input(shape=(window, n_features))
 
-    # Shared trunk -- unchanged capacity, still learns the common temporal
-    # structure across all 3 sensors.
+    # Shared trunk -- learns the common temporal structure across all 3 sensors.
     x = layers.LSTM(64, return_sequences=True)(inputs)
     x = layers.LayerNormalization()(x)
     x = layers.Dropout(0.2)(x)
@@ -119,10 +191,7 @@ def build_model(window, n_features, n_outputs, sensor_names):
     x = layers.LayerNormalization()(x)
     x = layers.Dropout(0.2)(x)
 
-    # NEW: per-sensor output heads instead of one shared Dense(16) bottleneck.
-    # Each head is small (8 units) so this adds only ~250 extra params per
-    # sensor -- a targeted capacity increase, not a general one, so it
-    # shouldn't meaningfully raise overfitting risk versus the old model.
+    # Per-sensor output heads (small: 8 units each).
     head_outputs = []
     for name in sensor_names:
         h = layers.Dense(8, activation="relu", name=f"{name}_head")(x)
@@ -138,6 +207,7 @@ def build_model(window, n_features, n_outputs, sensor_names):
         metrics=["mae"],
     )
     return model
+
 
 model = build_model(WINDOW, n_features, n_outputs, SENSORS)
 model.summary()
@@ -158,60 +228,62 @@ history = model.fit(
 )
 
 # ----------------------------------------------------------------------------
-# 7. Evaluate on test set, in ORIGINAL flow units
+# 7. Evaluate everything on the SAME test windows, in real vehicles/hour
 # ----------------------------------------------------------------------------
-y_pred_scaled = model.predict(X_test_seq)
+def evaluate(label, y_true, y_pred):
+    print(f"\n{label}")
+    out = {}
+    for i, s in enumerate(SENSORS):
+        err = y_true[:, i] - y_pred[:, i]
+        mae = np.mean(np.abs(err))
+        rmse = np.sqrt(np.mean(err ** 2))
+        r2 = r2_score(y_true[:, i], y_pred[:, i])
+        print(f"{s} -> MAE: {mae:.2f} vehicles/hr | RMSE: {rmse:.2f} vehicles/hr | R2: {r2:.4f}")
+        out[s] = {"mae": mae, "rmse": rmse, "r2": r2}
+    return out
+
+
+# Ground truth straight from the unscaled log1p targets (independent of the
+# scaler), inverted back to vehicles/hour.
+y_true = np.expm1(test_raw[TARGET_COLS].to_numpy()[test_end])
+
+# LSTM: scaled -> log1p space -> vehicles/hour (clipped: flow can't be negative)
+y_pred_scaled = model.predict(X_test_seq, verbose=0)
 y_pred_log = target_scaler.inverse_transform(y_pred_scaled)
-y_true_log = target_scaler.inverse_transform(y_test_seq)
+y_pred = np.clip(np.expm1(y_pred_log), 0, None)
 
-# NEW: invert the log1p applied in 02_feature_engineering.py so MAE/RMSE/R2
-# below are reported in real vehicles/hour, same units as every run so far.
-y_pred = np.expm1(y_pred_log)
-y_true = np.expm1(y_true_log)
+# Sanity check: labels that went through the scaler round-trip must match the
+# raw ground truth, otherwise windows and targets are misaligned.
+y_true_from_scaler = np.expm1(target_scaler.inverse_transform(y_test_seq))
+assert np.allclose(y_true, y_true_from_scaler, rtol=1e-3, atol=1e-2), \
+    "Test labels do not match raw targets -- window/target misalignment"
 
-print()
-for i, s in enumerate(SENSORS):
-    mae = np.mean(np.abs(y_true[:, i] - y_pred[:, i]))
-    rmse = np.sqrt(np.mean((y_true[:, i] - y_pred[:, i]) ** 2))
-    r2 = r2_score(y_true[:, i], y_pred[:, i])
-    print(f"{s} -> Test MAE: {mae:.2f} vehicles/hr | Test RMSE: {rmse:.2f} vehicles/hr | Test R2: {r2:.4f}")
+# Baselines, built on the same rows (test_end) the LSTM is scored on.
+#   persistence: the latest KNOWN hour (row e, same row the LSTM sees last)
+#   seasonal:    flow at the target hour minus 24h = row e-(24-HORIZON),
+#                which is always inside the window
+raw_now = test_raw[SENSORS].to_numpy()                      # log1p space
+persist_pred = np.expm1(raw_now[test_end])
+seasonal_pred = np.expm1(raw_now[test_end - (SEASONAL_LAG - HORIZON)])
 
-# ----------------------------------------------------------------------------
-# 8. Naive persistence baseline -- ALWAYS compare against this before trusting
-#    the LSTM's numbers. Given lag-1 autocorrelation ~0.84-0.89 from the EDA,
-#    "predict same as last known hour" can be a tough baseline to beat at
-#    HORIZON=1.
-# ----------------------------------------------------------------------------
-# raw (unscaled) sensor values, aligned to the same rows used in the test windows
-test_raw = pd.read_csv(PROCESSED_DIR / "GA0151_features.csv", parse_dates=["datetime"])
-test_raw = test_raw.sort_values("datetime").reset_index(drop=True).iloc[val_end:].reset_index(drop=True)
+print(f"\nEvaluated on {len(test_end):,} test windows, horizon = {HORIZON}h")
+lstm_res = evaluate("LSTM:", y_true, y_pred)
+pers_res = evaluate("Naive persistence baseline (predict = latest known hour):", y_true, persist_pred)
+seas_res = evaluate(f"Seasonal-naive baseline (same hour {SEASONAL_LAG}h earlier):", y_true, seasonal_pred)
 
-print("\nNaive persistence baseline (predict = last known raw value):")
-seg_ids = test_raw["segment_id"].to_numpy()
-for i, s in enumerate(SENSORS):
-    # NEW: these columns are in log1p space (written that way by
-    # 02_feature_engineering.py) -- invert with expm1 so the baseline is
-    # compared in the same real vehicles/hour units as the model above.
-    raw_vals = np.expm1(test_raw[s].to_numpy())
-    targets = np.expm1(test_raw[f"{s}_target"].to_numpy())
-    preds, actuals = [], []
-    for idx in range(WINDOW, len(test_raw)):
-        if seg_ids[idx] != seg_ids[idx - 1]:
-            continue
-        preds.append(raw_vals[idx - 1])
-        actuals.append(targets[idx])
-    preds, actuals = np.array(preds), np.array(actuals)
-    mae = np.mean(np.abs(actuals - preds))
-    rmse = np.sqrt(np.mean((actuals - preds) ** 2))
-    r2 = r2_score(actuals, preds)
-    print(f"{s} -> Baseline MAE: {mae:.2f} | Baseline RMSE: {rmse:.2f} | Baseline R2: {r2:.4f}")
+print("\nLSTM improvement over the better of the two baselines (positive = LSTM better):")
+for s in SENSORS:
+    best_mae = min(pers_res[s]["mae"], seas_res[s]["mae"])
+    best_rmse = min(pers_res[s]["rmse"], seas_res[s]["rmse"])
+    print(f"{s} -> MAE {100 * (1 - lstm_res[s]['mae'] / best_mae):+.1f}% | "
+          f"RMSE {100 * (1 - lstm_res[s]['rmse'] / best_rmse):+.1f}%")
 
 # ----------------------------------------------------------------------------
-# Next steps if the LSTM doesn't clearly beat the baseline above:
+# Next steps if the LSTM doesn't clearly beat the baselines above:
 # - Check train_loss vs val_loss from the fit() log:
 #     close + both mediocre -> underfitting (more capacity / longer WINDOW)
 #     train << val, gap widening -> overfitting (cut hidden units first)
-# - Compare this run's RMSE (not just MAE/R2) against the pre-log-transform
-#   run for GA0151_A specifically -- that's the metric the log transform is
-#   meant to fix, since it was RMSE, not MAE, that had gotten worse.
+# - Val and test are later, contiguous slices of the data, so they can cover
+#   different seasons than train. If val_loss stays well above train_loss, look
+#   at which months each split contains before changing the architecture.
 # ----------------------------------------------------------------------------
