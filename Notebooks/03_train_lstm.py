@@ -26,7 +26,7 @@ from tensorflow.keras import layers, models, callbacks
 # Config
 # ----------------------------------------------------------------------------
 PROCESSED_DIR = Path("../dataset/processed")
-SENSORS = ["GD0151_B", "GD0151_C", "GD0151_D"]
+SENSORS = ["GD0501_B", "GD0501_C", "GD0501_D"]
 WINDOW = 48          # hours of history fed to the LSTM per prediction
 VAL_FRAC = 0.15
 TEST_FRAC = 0.15

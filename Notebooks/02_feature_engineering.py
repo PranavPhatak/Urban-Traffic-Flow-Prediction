@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 PROCESSED_DIR = Path("../dataset/processed")
-SENSORS = ["GD0151_B", "GD0151_C", "GD0151_D"]
+SENSORS = ["GD0501_B", "GD0501_C", "GD0501_D"]
 HORIZON = 1          # forecast horizon in hours; e.g. 24 for next-day-same-hour
 ROLLING_STD_WINDOW = 24
 
