@@ -106,9 +106,11 @@ n_outputs = len(TARGET_COLS)
 #    which disables cuDNN), LayerNormalization instead of BatchNormalization
 #    (BatchNorm inside a recurrent stack is a known failure mode).
 # ----------------------------------------------------------------------------
-def build_model(window, n_features, n_outputs):
+def build_model(window, n_features, n_outputs, sensor_names):
     inputs = layers.Input(shape=(window, n_features))
 
+    # Shared trunk -- unchanged capacity, still learns the common temporal
+    # structure across all 3 sensors.
     x = layers.LSTM(64, return_sequences=True)(inputs)
     x = layers.LayerNormalization()(x)
     x = layers.Dropout(0.2)(x)
@@ -117,8 +119,17 @@ def build_model(window, n_features, n_outputs):
     x = layers.LayerNormalization()(x)
     x = layers.Dropout(0.2)(x)
 
-    x = layers.Dense(16, activation="relu")(x)
-    outputs = layers.Dense(n_outputs, activation="linear")(x)
+    # NEW: per-sensor output heads instead of one shared Dense(16) bottleneck.
+    # Each head is small (8 units) so this adds only ~250 extra params per
+    # sensor -- a targeted capacity increase, not a general one, so it
+    # shouldn't meaningfully raise overfitting risk versus the old model.
+    head_outputs = []
+    for name in sensor_names:
+        h = layers.Dense(8, activation="relu", name=f"{name}_head")(x)
+        out = layers.Dense(1, activation="linear", name=f"{name}_out")(h)
+        head_outputs.append(out)
+
+    outputs = layers.Concatenate()(head_outputs)
 
     model = models.Model(inputs, outputs)
     model.compile(
@@ -128,7 +139,7 @@ def build_model(window, n_features, n_outputs):
     )
     return model
 
-model = build_model(WINDOW, n_features, n_outputs)
+model = build_model(WINDOW, n_features, n_outputs, SENSORS)
 model.summary()
 
 # ----------------------------------------------------------------------------
