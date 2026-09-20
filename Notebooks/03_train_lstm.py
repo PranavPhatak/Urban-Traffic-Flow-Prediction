@@ -31,6 +31,10 @@ FIXED in this version (the reason the baseline looked "too low"):
   features, so persistence alone is a weak yardstick.
 - Added sanity checks that fail loudly if targets, windows or the scaler
   inversion are misaligned.
+- Stronger baselines (profile-adjusted persistence, Ridge on the same windows),
+  all fit on train only. They sit AFTER training/evaluation of the LSTM and do
+  not touch the model, data, seed or training loop, so LSTM results are
+  unchanged by them.
 """
 
 from pathlib import Path
@@ -38,6 +42,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score
+from sklearn.linear_model import Ridge
 
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks
@@ -50,6 +55,7 @@ SENSORS = ["GD0501_B", "GD0501_C", "GD0501_D"]
 HORIZON = 1          # hours ahead. MUST equal HORIZON in 02_feature_engineering.py
 WINDOW = 48          # hours of history fed to the LSTM per prediction
 SEASONAL_LAG = 24    # "same hour yesterday" baseline
+RIDGE_ALPHAS = [1, 10, 100, 1000, 10000]   # picked on VAL, never on test
 VAL_FRAC = 0.15
 TEST_FRAC = 0.15
 BATCH_SIZE = 64
@@ -120,6 +126,7 @@ print(f"Test:  {test_df['datetime'].min()} -> {test_df['datetime'].max()}  ({len
 # Baselines and the ground truth are taken from this, so they never depend on
 # the scaler.
 test_raw = test_df.reset_index(drop=True)
+train_raw = train_df.reset_index(drop=True)   # for the train-only baselines below
 
 # ----------------------------------------------------------------------------
 # 3. Scale -- fit ONLY on train
@@ -258,25 +265,74 @@ y_true_from_scaler = np.expm1(target_scaler.inverse_transform(y_test_seq))
 assert np.allclose(y_true, y_true_from_scaler, rtol=1e-3, atol=1e-2), \
     "Test labels do not match raw targets -- window/target misalignment"
 
-# Baselines, built on the same rows (test_end) the LSTM is scored on.
-#   persistence: the latest KNOWN hour (row e, same row the LSTM sees last)
-#   seasonal:    flow at the target hour minus 24h = row e-(24-HORIZON),
-#                which is always inside the window
+# ---------------------------------------------------------------------------
+# Baselines. Every one is scored on the same test windows (test_end) as the
+# LSTM, and everything learned (profile, ridge weights, ridge alpha) uses TRAIN
+# (and VAL for alpha) only -- nothing is tuned on test.
+# ---------------------------------------------------------------------------
 raw_now = test_raw[SENSORS].to_numpy()                      # log1p space
+
+# (1) persistence: the latest KNOWN hour (row e, the same row the LSTM sees last)
 persist_pred = np.expm1(raw_now[test_end])
+
+# (2) seasonal naive: flow at the target hour minus 24h = row e-(24-HORIZON),
+#     which is always inside the window
 seasonal_pred = np.expm1(raw_now[test_end - (SEASONAL_LAG - HORIZON)])
+
+
+# (3) profile-adjusted persistence: last known value + the TYPICAL hour-to-hour
+#     change for that hour of the week (learned from train). Plain persistence
+#     is blind to the morning/evening ramps; this keeps its "start from what we
+#     just saw" strength and adds the expected ramp. Done in log1p space.
+def hour_of_week(frame):
+    dt = frame["datetime"]
+    return (dt.dt.dayofweek * 24 + dt.dt.hour).to_numpy()
+
+
+profile = train_raw.groupby(hour_of_week(train_raw))[SENSORS].median().reindex(range(168))
+assert not profile.isna().any().any(), "train split is missing some hour-of-week bins"
+profile = profile.to_numpy()                                # (168, n_sensors)
+
+how_now = hour_of_week(test_raw)[test_end]
+how_target = (how_now + HORIZON) % 168
+profile_pred = np.clip(
+    np.expm1(raw_now[test_end] + profile[how_target] - profile[how_now]), 0, None
+)
+
+# (4) Ridge (linear) on the exact same flattened windows the LSTM gets. This is
+#     the honest "is the recurrent network actually needed?" check. alpha is
+#     chosen on validation.
+Xtr = X_train_seq.reshape(len(X_train_seq), -1)
+Xva = X_val_seq.reshape(len(X_val_seq), -1)
+Xte = X_test_seq.reshape(len(X_test_seq), -1)
+best_val, best_alpha, ridge = None, None, None
+for alpha in RIDGE_ALPHAS:
+    candidate = Ridge(alpha=alpha).fit(Xtr, y_train_seq)
+    val_mae = np.mean(np.abs(candidate.predict(Xva) - y_val_seq))
+    if best_val is None or val_mae < best_val:
+        best_val, best_alpha, ridge = val_mae, alpha, candidate
+print(f"\nRidge baseline: alpha={best_alpha} (chosen on validation)")
+ridge_pred = np.clip(
+    np.expm1(target_scaler.inverse_transform(ridge.predict(Xte))), 0, None
+)
 
 print(f"\nEvaluated on {len(test_end):,} test windows, horizon = {HORIZON}h")
 lstm_res = evaluate("LSTM:", y_true, y_pred)
-pers_res = evaluate("Naive persistence baseline (predict = latest known hour):", y_true, persist_pred)
-seas_res = evaluate(f"Seasonal-naive baseline (same hour {SEASONAL_LAG}h earlier):", y_true, seasonal_pred)
+baseline_res = {
+    "persistence": evaluate("Naive persistence baseline (predict = latest known hour):", y_true, persist_pred),
+    "seasonal-24h": evaluate(f"Seasonal-naive baseline (same hour {SEASONAL_LAG}h earlier):", y_true, seasonal_pred),
+    "profile-persistence": evaluate("Profile-adjusted persistence (latest hour + typical hourly change):", y_true, profile_pred),
+    "ridge": evaluate("Ridge regression on the same windows (linear, no recurrence):", y_true, ridge_pred),
+}
 
-print("\nLSTM improvement over the better of the two baselines (positive = LSTM better):")
+print("\nLSTM vs the STRONGEST baseline per sensor (positive = LSTM better):")
 for s in SENSORS:
-    best_mae = min(pers_res[s]["mae"], seas_res[s]["mae"])
-    best_rmse = min(pers_res[s]["rmse"], seas_res[s]["rmse"])
-    print(f"{s} -> MAE {100 * (1 - lstm_res[s]['mae'] / best_mae):+.1f}% | "
-          f"RMSE {100 * (1 - lstm_res[s]['rmse'] / best_rmse):+.1f}%")
+    best_mae_name = min(baseline_res, key=lambda k: baseline_res[k][s]["mae"])
+    best_rmse_name = min(baseline_res, key=lambda k: baseline_res[k][s]["rmse"])
+    best_mae = baseline_res[best_mae_name][s]["mae"]
+    best_rmse = baseline_res[best_rmse_name][s]["rmse"]
+    print(f"{s} -> MAE {100 * (1 - lstm_res[s]['mae'] / best_mae):+.1f}% (vs {best_mae_name}) | "
+          f"RMSE {100 * (1 - lstm_res[s]['rmse'] / best_rmse):+.1f}% (vs {best_rmse_name})")
 
 # ----------------------------------------------------------------------------
 # Next steps if the LSTM doesn't clearly beat the baselines above:
