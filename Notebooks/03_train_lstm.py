@@ -161,8 +161,13 @@ history = model.fit(
 # 7. Evaluate on test set, in ORIGINAL flow units
 # ----------------------------------------------------------------------------
 y_pred_scaled = model.predict(X_test_seq)
-y_pred = target_scaler.inverse_transform(y_pred_scaled)
-y_true = target_scaler.inverse_transform(y_test_seq)
+y_pred_log = target_scaler.inverse_transform(y_pred_scaled)
+y_true_log = target_scaler.inverse_transform(y_test_seq)
+
+# NEW: invert the log1p applied in 02_feature_engineering.py so MAE/RMSE/R2
+# below are reported in real vehicles/hour, same units as every run so far.
+y_pred = np.expm1(y_pred_log)
+y_true = np.expm1(y_true_log)
 
 print()
 for i, s in enumerate(SENSORS):
@@ -184,8 +189,11 @@ test_raw = test_raw.sort_values("datetime").reset_index(drop=True).iloc[val_end:
 print("\nNaive persistence baseline (predict = last known raw value):")
 seg_ids = test_raw["segment_id"].to_numpy()
 for i, s in enumerate(SENSORS):
-    raw_vals = test_raw[s].to_numpy()
-    targets = test_raw[f"{s}_target"].to_numpy()
+    # NEW: these columns are in log1p space (written that way by
+    # 02_feature_engineering.py) -- invert with expm1 so the baseline is
+    # compared in the same real vehicles/hour units as the model above.
+    raw_vals = np.expm1(test_raw[s].to_numpy())
+    targets = np.expm1(test_raw[f"{s}_target"].to_numpy())
     preds, actuals = [], []
     for idx in range(WINDOW, len(test_raw)):
         if seg_ids[idx] != seg_ids[idx - 1]:
@@ -195,14 +203,15 @@ for i, s in enumerate(SENSORS):
     preds, actuals = np.array(preds), np.array(actuals)
     mae = np.mean(np.abs(actuals - preds))
     rmse = np.sqrt(np.mean((actuals - preds) ** 2))
-    print(f"{s} -> Baseline MAE: {mae:.2f} | Baseline RMSE: {rmse:.2f}")
+    r2 = r2_score(actuals, preds)
+    print(f"{s} -> Baseline MAE: {mae:.2f} | Baseline RMSE: {rmse:.2f} | Baseline R2: {r2:.4f}")
 
 # ----------------------------------------------------------------------------
 # Next steps if the LSTM doesn't clearly beat the baseline above:
 # - Check train_loss vs val_loss from the fit() log:
 #     close + both mediocre -> underfitting (more capacity / longer WINDOW)
 #     train << val, gap widening -> overfitting (cut hidden units first)
-# - Try a longer HORIZON (e.g. 24h) in 02_feature_engineering.py -- 1-hour-
-#   ahead forecasts are inherently close to persistence given the sensor
-#   autocorrelation seen in the EDA.
+# - Compare this run's RMSE (not just MAE/R2) against the pre-log-transform
+#   run for GA0151_A specifically -- that's the metric the log transform is
+#   meant to fix, since it was RMSE, not MAE, that had gotten worse.
 # ----------------------------------------------------------------------------

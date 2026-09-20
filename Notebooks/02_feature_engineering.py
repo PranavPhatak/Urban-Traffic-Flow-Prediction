@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-PROCESSED_DIR = Path("../dataset/processed")
+PROCESSED_DIR = Path("dataset/processed")
 SENSORS = ["GA0151_A", "GA0151_C", "GA0151_D"]
 HORIZON = 1          # forecast horizon in hours; e.g. 24 for next-day-same-hour
 ROLLING_STD_WINDOW = 24
@@ -36,6 +36,20 @@ ROLLING_STD_WINDOW = 24
 EXCLUDE_COVID_PERIOD = True
 COVID_EXCLUDE_START = "2020-03-01"
 COVID_EXCLUDE_END = "2021-12-31"
+
+# NEW: log1p-transform the raw flow signal before anything is derived from it.
+# Traffic counts are classic heavy-tailed/skewed data -- GA0151_A in
+# particular has 516 IQR-outlier spikes out of ~33k rows (vs 1 for C, 31 for
+# D) and the highest coefficient of variation of the three sensors. Under
+# plain MSE, a spike to 200 produces a squared-error gradient ~400x a normal
+# hour, which pulls training toward chasing noise. log1p compresses that
+# without discarding the data. Applying it HERE (immediately after load,
+# before rolling_std/neighbor_mean/target are computed) means every
+# downstream feature and the target itself are consistently in log space --
+# no mismatch between what train and eval see. Predictions are inverted with
+# expm1 in 03_train_lstm.py before computing MAE/RMSE/R2, so all reported
+# metrics stay in real vehicles/hour.
+LOG_TRANSFORM_FLOW = True
 
 # ----------------------------------------------------------------------------
 # 1. Load cleaned data
@@ -55,6 +69,16 @@ if EXCLUDE_COVID_PERIOD:
     df = df[~covid_mask].reset_index(drop=True)
     print(f"Excluded COVID window {COVID_EXCLUDE_START} -> {COVID_EXCLUDE_END}: "
           f"removed {before - len(df):,} rows ({len(df):,} remain)")
+
+# ----------------------------------------------------------------------------
+# 1c. NEW: log1p-transform the raw flow columns. Done before gap_row/segment
+#     logic (which only cares about NaN positions -- log1p(NaN) stays NaN, so
+#     this doesn't interact with gap detection) and before every feature that
+#     derives from SENSORS below, so rolling_std, neighbor_mean, and the
+#     target are all computed consistently in log space.
+# ----------------------------------------------------------------------------
+if LOG_TRANSFORM_FLOW:
+    df[SENSORS] = np.log1p(df[SENSORS])
 
 # Rows that are still NaN after cleaning are unfilled long gaps -- they can't
 # be used as inputs, but keeping them in place (for now) is what lets us
