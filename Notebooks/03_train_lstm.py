@@ -40,6 +40,8 @@ FIXED in this version (the reason the baseline looked "too low"):
   candidate has the best VALIDATION RMSE. The original 3-output model is
   trained exactly as before, and the B and C columns are never replaced, so
   their predictions/metrics are unchanged.
+- The D candidates now include seed-averaged, flow-weighted and Huber-loss
+  specialists (Huber limits the pull of unpredictable one-off surges/dropouts).
 """
 
 from pathlib import Path
@@ -62,6 +64,7 @@ WINDOW = 48          # hours of history fed to the LSTM per prediction
 SEASONAL_LAG = 24    # "same hour yesterday" baseline
 RIDGE_ALPHAS = [1, 10, 100, 1000, 10000]   # picked on VAL, never on test
 SPECIALIST_SENSORS = ["GD0501_D"]   # sensors that also get a dedicated model (B/C left untouched)
+SPECIALIST_SEEDS = 3                  # networks averaged per weighted variant (more = steadier, slower)
 VAL_FRAC = 0.15
 TEST_FRAC = 0.15
 BATCH_SIZE = 64
@@ -276,29 +279,36 @@ assert np.allclose(y_true, y_true_from_scaler, rtol=1e-3, atol=1e-2), \
 # ---------------------------------------------------------------------------
 # 7a. Dedicated models for the weakest sensor(s).
 #
-# Why a separate model instead of changing the shared one: any change to the
+# Why separate models instead of changing the shared one: any change to the
 # 3-output network (size, loss, weights) changes the random init/gradients for
-# B and C too. Training extra models AFTER it leaves B and C bit-for-bit the
-# same, and the original model's D output stays in the running as a candidate.
+# B and C too. Extra models trained AFTER it leave B and C bit-for-bit the same,
+# and the original model's D output stays in the running as a candidate.
 #
-# Candidates for each sensor, all judged on VALIDATION real-unit RMSE (test is
-# printed for information only and never used to choose):
-#   multi-output : D output of the original 3-output model
-#   specialist   : single-output model, same trunk, dedicated head/capacity
-#   specialist-weighted : same, but the loss is weighted by flow level. The
-#       models train in log1p space, where a 2-vs-5 vehicle error at 3am costs
-#       as much as a 200-vs-500 error at rush hour, yet MAE/RMSE are measured in
-#       vehicles/hr. Since d(vehicles) ~ (v+1) * d(log1p v), weighting by (v+1)
-#       pulls the training objective toward the metric we report.
-#   ensemble     : mean of the three (averaging independently trained nets
-#                  usually reduces variance)
+# Candidates, all judged on VALIDATION real-unit RMSE (test is printed for
+# information only and never used to choose):
+#   multi-output   : D output of the original 3-output model
+#   specialist     : 1 single-output model (same trunk, dedicated head), plain MSE
+#   weighted       : mean of SPECIALIST_SEEDS specialists trained with a
+#       flow-weighted loss. Training is in log1p space, where a 2-vs-5 vehicle
+#       error at 3am costs as much as 200-vs-500 at rush hour, yet MAE/RMSE are
+#       in vehicles/hr. Since d(vehicles) ~ (v+1) * d(log1p v), weighting by
+#       (v+1) pulls the objective toward the metric we report.
+#   weighted-huber : mean of SPECIALIST_SEEDS specialists, flow-weighted HUBER
+#       loss. D's biggest errors are targets that history cannot predict (one-off
+#       surges, sensor dropouts to ~0). Under MSE those few samples dominate the
+#       gradient; Huber caps their pull so the model fits the typical hours.
+#   ensemble       : mean of the four candidates above
+#
+# Seed-averaging cuts the run-to-run noise of a single network. All averaging
+# is done in vehicles/hour (not log space), which avoids the downward bias of
+# averaging log-predictions before expm1.
 # ---------------------------------------------------------------------------
 def scaled_to_vehicles(y_scaled, j):
     """One target column: scaled -> log1p space -> vehicles/hour (>= 0)."""
     return np.clip(np.expm1(y_scaled * target_scaler.scale_[j] + target_scaler.mean_[j]), 0, None)
 
 
-def build_single_model(window, n_features, name):
+def build_single_model(window, n_features, name, huber):
     inputs = layers.Input(shape=(window, n_features))
     x = layers.LSTM(64, return_sequences=True)(inputs)
     x = layers.LayerNormalization()(x)
@@ -309,13 +319,14 @@ def build_single_model(window, n_features, name):
     x = layers.Dense(16, activation="relu", name=f"{name}_head")(x)
     out = layers.Dense(1, activation="linear", name=f"{name}_out")(x)
     m = models.Model(inputs, out, name=f"{name}_specialist")
-    m.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss="mse")
+    loss = tf.keras.losses.Huber(delta=1.0) if huber else "mse"   # delta in scaled-log std units
+    m.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss=loss)
     return m
 
 
-def fit_specialist(j, sensor, weighted, seed):
+def fit_specialist(j, sensor, weighted, huber, seed):
     tf.keras.utils.set_random_seed(seed)
-    m = build_single_model(WINDOW, n_features, sensor)
+    m = build_single_model(WINDOW, n_features, sensor, huber)
     ytr, yva = y_train_seq[:, [j]], y_val_seq[:, [j]]
     if weighted:
         w_tr = np.expm1(target_scaler.inverse_transform(y_train_seq))[:, j] + 1.0
@@ -332,10 +343,19 @@ def fit_specialist(j, sensor, weighted, seed):
     ]
     h = m.fit(X_train_seq, ytr, validation_data=val_data, epochs=EPOCHS,
               batch_size=BATCH_SIZE, callbacks=cbs, verbose=0, **fit_kwargs)
-    print(f"  trained {'weighted ' if weighted else ''}specialist for {sensor}: "
+    tag = ("weighted " if weighted else "") + ("huber " if huber else "")
+    print(f"  trained {tag}specialist for {sensor} (seed {seed}): "
           f"{len(h.history['loss'])} epochs, best val_loss {min(h.history['val_loss']):.4f}")
     return m
 
+
+# name, flow-weighted?, huber?, seed offset, number of seeds averaged
+# (seed offsets 1 and 2 are the same seeds as the previous version of this script)
+SPECIALIST_VARIANTS = [
+    ("specialist",     False, False, 1,  1),
+    ("weighted",       True,  False, 2,  SPECIALIST_SEEDS),
+    ("weighted-huber", True,  True,  12, SPECIALIST_SEEDS),
+]
 
 y_val_true = np.expm1(target_scaler.inverse_transform(y_val_seq))
 val_pred_scaled = model.predict(X_val_seq, verbose=0)
@@ -344,29 +364,34 @@ y_pred_final = y_pred.copy()          # B/C columns are never modified
 for sensor in SPECIALIST_SENSORS:
     j = SENSORS.index(sensor)
     print(f"\nDedicated models for {sensor}:")
-    cand_val = {"multi-output": val_pred_scaled[:, j]}
-    cand_test = {"multi-output": y_pred_scaled[:, j]}
-    for name, weighted, seed in (("specialist", False, SEED + 1),
-                                 ("specialist-weighted", True, SEED + 2)):
-        m = fit_specialist(j, sensor, weighted, seed)
-        cand_val[name] = m.predict(X_val_seq, verbose=0)[:, 0]
-        cand_test[name] = m.predict(X_test_seq, verbose=0)[:, 0]
-    base_names = list(cand_val)
-    cand_val["ensemble"] = np.mean([cand_val[k] for k in base_names], axis=0)
-    cand_test["ensemble"] = np.mean([cand_test[k] for k in base_names], axis=0)
+    veh_val = {"multi-output": scaled_to_vehicles(val_pred_scaled[:, j], j)}
+    veh_test = {"multi-output": scaled_to_vehicles(y_pred_scaled[:, j], j)}
+    for name, weighted, huber, offset, n_seeds in SPECIALIST_VARIANTS:
+        pv, pt = [], []
+        for k in range(n_seeds):
+            m = fit_specialist(j, sensor, weighted, huber, SEED + offset + k)
+            pv.append(scaled_to_vehicles(m.predict(X_val_seq, verbose=0)[:, 0], j))
+            pt.append(scaled_to_vehicles(m.predict(X_test_seq, verbose=0)[:, 0], j))
+            del m
+        veh_val[name] = np.mean(pv, axis=0)
+        veh_test[name] = np.mean(pt, axis=0)
+    members = list(veh_val)
+    veh_val["ensemble"] = np.mean([veh_val[k] for k in members], axis=0)
+    veh_test["ensemble"] = np.mean([veh_test[k] for k in members], axis=0)
 
     print(f"\n{sensor} candidates (selection uses VAL RMSE only):")
-    print(f"{'candidate':22s} {'val RMSE':>9s} {'val MAE':>8s} | {'test RMSE':>9s} {'test MAE':>8s}")
+    print(f"{'candidate':16s} {'val RMSE':>9s} {'val MAE':>8s} | {'test RMSE':>9s} {'test MAE':>8s} {'test R2':>8s}")
     val_rmse = {}
-    for k in cand_val:
-        ev = y_val_true[:, j] - scaled_to_vehicles(cand_val[k], j)
-        et = y_true[:, j] - scaled_to_vehicles(cand_test[k], j)
+    for k in veh_val:
+        ev = y_val_true[:, j] - veh_val[k]
+        et = y_true[:, j] - veh_test[k]
         val_rmse[k] = np.sqrt(np.mean(ev ** 2))
-        print(f"{k:22s} {val_rmse[k]:9.2f} {np.mean(np.abs(ev)):8.2f} | "
-              f"{np.sqrt(np.mean(et ** 2)):9.2f} {np.mean(np.abs(et)):8.2f}")
+        print(f"{k:16s} {val_rmse[k]:9.2f} {np.mean(np.abs(ev)):8.2f} | "
+              f"{np.sqrt(np.mean(et ** 2)):9.2f} {np.mean(np.abs(et)):8.2f} "
+              f"{r2_score(y_true[:, j], veh_test[k]):8.4f}")
     best = min(val_rmse, key=val_rmse.get)
     print(f"-> selected for {sensor}: {best}")
-    y_pred_final[:, j] = scaled_to_vehicles(cand_test[best], j)
+    y_pred_final[:, j] = veh_test[best]
 
 # ---------------------------------------------------------------------------
 # Baselines. Every one is scored on the same test windows (test_end) as the
