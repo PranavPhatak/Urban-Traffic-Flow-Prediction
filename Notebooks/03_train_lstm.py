@@ -42,6 +42,10 @@ FIXED in this version (the reason the baseline looked "too low"):
   their predictions/metrics are unchanged.
 - The D candidates now include seed-averaged, flow-weighted and Huber-loss
   specialists (Huber limits the pull of unpredictable one-off surges/dropouts).
+- A residual specialist for D that forecasts the CHANGE from the latest hour, so
+  an unusual level (e.g. a busy night) is carried forward instead of being
+  pulled back to the usual value for that hour. Chosen only if it wins on
+  validation.
 """
 
 from pathlib import Path
@@ -136,6 +140,7 @@ print(f"Test:  {test_df['datetime'].min()} -> {test_df['datetime'].max()}  ({len
 # the scaler.
 test_raw = test_df.reset_index(drop=True)
 train_raw = train_df.reset_index(drop=True)   # for the train-only baselines below
+val_raw = val_df.reset_index(drop=True)
 
 # ----------------------------------------------------------------------------
 # 3. Scale -- fit ONLY on train
@@ -181,8 +186,8 @@ def make_sequences(split_df, window):
     return X, y, end_idx
 
 
-X_train_seq, y_train_seq, _ = make_sequences(train_df, WINDOW)
-X_val_seq, y_val_seq, _ = make_sequences(val_df, WINDOW)
+X_train_seq, y_train_seq, train_end_idx = make_sequences(train_df, WINDOW)
+X_val_seq, y_val_seq, val_end_idx = make_sequences(val_df, WINDOW)
 X_test_seq, y_test_seq, test_end = make_sequences(test_df, WINDOW)
 
 print(f"\nSequence shapes -> train: {X_train_seq.shape}, val: {X_val_seq.shape}, test: {X_test_seq.shape}")
@@ -293,11 +298,21 @@ assert np.allclose(y_true, y_true_from_scaler, rtol=1e-3, atol=1e-2), \
 #       error at 3am costs as much as 200-vs-500 at rush hour, yet MAE/RMSE are
 #       in vehicles/hr. Since d(vehicles) ~ (v+1) * d(log1p v), weighting by
 #       (v+1) pulls the objective toward the metric we report.
-#   weighted-huber : mean of SPECIALIST_SEEDS specialists, flow-weighted HUBER
-#       loss. D's biggest errors are targets that history cannot predict (one-off
-#       surges, sensor dropouts to ~0). Under MSE those few samples dominate the
-#       gradient; Huber caps their pull so the model fits the typical hours.
-#   ensemble       : mean of the four candidates above
+#   weighted-huber : same, with a HUBER loss so a few unpredictable targets
+#       (one-off surges, sensor dropouts) cannot dominate the gradient.
+#   residual-huber : NEW. Same loss, but the network predicts the CHANGE from
+#       the latest observed hour instead of the absolute level:
+#           log1p(flow at t+H) = log1p(flow at t) + network output
+#       Why: D's worst test windows are a night-time surge (31 May - 2 Jun,
+#       63-173 veh/hr at 00:00-03:00). The direct models answered ~6 veh/hr
+#       even when the hour they had just seen was 143, because "night = quiet"
+#       is baked into their weights and a busy night is out of distribution for
+#       them. With the residual form the forecast starts from what was just
+#       observed and the network only has to learn the typical change, which is
+#       small at night, so an out-of-distribution level is carried through
+#       (persistence-like) instead of being pulled back to the usual night value.
+#   blend-huber    : mean of weighted-huber and residual-huber
+#   ensemble       : mean of the five models above
 #
 # Seed-averaging cuts the run-to-run noise of a single network. All averaging
 # is done in vehicles/hour (not log space), which avoids the downward bias of
@@ -306,6 +321,36 @@ assert np.allclose(y_true, y_true_from_scaler, rtol=1e-3, atol=1e-2), \
 def scaled_to_vehicles(y_scaled, j):
     """One target column: scaled -> log1p space -> vehicles/hour (>= 0)."""
     return np.clip(np.expm1(y_scaled * target_scaler.scale_[j] + target_scaler.mean_[j]), 0, None)
+
+
+# Anchors for the residual model, taken from the UNSCALED frames on exactly the
+# rows each window ends at: now_log = log1p flow of the newest hour in the
+# window, tgt_log = log1p flow HORIZON hours later.
+fi = [FEATURE_COLS.index(s) for s in SENSORS]
+now_log = {
+    "train": train_raw[SENSORS].to_numpy()[train_end_idx],
+    "val": val_raw[SENSORS].to_numpy()[val_end_idx],
+    "test": test_raw[SENSORS].to_numpy()[test_end],
+}
+tgt_log = {
+    "train": train_raw[TARGET_COLS].to_numpy()[train_end_idx],
+    "val": val_raw[TARGET_COLS].to_numpy()[val_end_idx],
+    "test": test_raw[TARGET_COLS].to_numpy()[test_end],
+}
+# Sanity check: the anchor must equal the newest hour the network is given.
+_newest_input = X_test_seq[:, -1, fi] * feature_scaler.scale_[fi] + feature_scaler.mean_[fi]
+assert np.allclose(_newest_input, now_log["test"], atol=1e-3), \
+    "Residual anchor does not match the newest input hour -- window misalignment"
+_delta_train = tgt_log["train"] - now_log["train"]
+res_mean, res_std = _delta_train.mean(axis=0), _delta_train.std(axis=0)   # train stats only
+
+
+def to_vehicles(out, j, split, residual):
+    """Network output -> vehicles/hour for a split ('train'/'val'/'test')."""
+    if residual:
+        log_pred = now_log[split][:, j] + out * res_std[j] + res_mean[j]
+        return np.clip(np.expm1(log_pred), 0, None)
+    return scaled_to_vehicles(out, j)
 
 
 def build_single_model(window, n_features, name, huber):
@@ -319,15 +364,19 @@ def build_single_model(window, n_features, name, huber):
     x = layers.Dense(16, activation="relu", name=f"{name}_head")(x)
     out = layers.Dense(1, activation="linear", name=f"{name}_out")(x)
     m = models.Model(inputs, out, name=f"{name}_specialist")
-    loss = tf.keras.losses.Huber(delta=1.0) if huber else "mse"   # delta in scaled-log std units
+    loss = tf.keras.losses.Huber(delta=1.0) if huber else "mse"   # delta in standardised units
     m.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss=loss)
     return m
 
 
-def fit_specialist(j, sensor, weighted, huber, seed):
+def fit_specialist(j, sensor, weighted, huber, residual, seed):
     tf.keras.utils.set_random_seed(seed)
     m = build_single_model(WINDOW, n_features, sensor, huber)
-    ytr, yva = y_train_seq[:, [j]], y_val_seq[:, [j]]
+    if residual:
+        ytr = ((tgt_log["train"][:, j] - now_log["train"][:, j] - res_mean[j]) / res_std[j])[:, None]
+        yva = ((tgt_log["val"][:, j] - now_log["val"][:, j] - res_mean[j]) / res_std[j])[:, None]
+    else:
+        ytr, yva = y_train_seq[:, [j]], y_val_seq[:, [j]]
     if weighted:
         w_tr = np.expm1(target_scaler.inverse_transform(y_train_seq))[:, j] + 1.0
         w_va = np.expm1(target_scaler.inverse_transform(y_val_seq))[:, j] + 1.0
@@ -343,18 +392,19 @@ def fit_specialist(j, sensor, weighted, huber, seed):
     ]
     h = m.fit(X_train_seq, ytr, validation_data=val_data, epochs=EPOCHS,
               batch_size=BATCH_SIZE, callbacks=cbs, verbose=0, **fit_kwargs)
-    tag = ("weighted " if weighted else "") + ("huber " if huber else "")
+    tag = ("weighted " if weighted else "") + ("huber " if huber else "") + ("residual " if residual else "")
     print(f"  trained {tag}specialist for {sensor} (seed {seed}): "
           f"{len(h.history['loss'])} epochs, best val_loss {min(h.history['val_loss']):.4f}")
     return m
 
 
-# name, flow-weighted?, huber?, seed offset, number of seeds averaged
-# (seed offsets 1 and 2 are the same seeds as the previous version of this script)
+# name, flow-weighted?, huber?, residual?, seed offset, number of seeds averaged
+# (seed offsets 1, 2 and 12 are the same seeds as the previous version of this script)
 SPECIALIST_VARIANTS = [
-    ("specialist",     False, False, 1,  1),
-    ("weighted",       True,  False, 2,  SPECIALIST_SEEDS),
-    ("weighted-huber", True,  True,  12, SPECIALIST_SEEDS),
+    ("specialist",     False, False, False, 1,  1),
+    ("weighted",       True,  False, False, 2,  SPECIALIST_SEEDS),
+    ("weighted-huber", True,  True,  False, 12, SPECIALIST_SEEDS),
+    ("residual-huber", True,  True,  True,  22, SPECIALIST_SEEDS),
 ]
 
 y_val_true = np.expm1(target_scaler.inverse_transform(y_val_seq))
@@ -366,16 +416,18 @@ for sensor in SPECIALIST_SENSORS:
     print(f"\nDedicated models for {sensor}:")
     veh_val = {"multi-output": scaled_to_vehicles(val_pred_scaled[:, j], j)}
     veh_test = {"multi-output": scaled_to_vehicles(y_pred_scaled[:, j], j)}
-    for name, weighted, huber, offset, n_seeds in SPECIALIST_VARIANTS:
+    for name, weighted, huber, residual, offset, n_seeds in SPECIALIST_VARIANTS:
         pv, pt = [], []
         for k in range(n_seeds):
-            m = fit_specialist(j, sensor, weighted, huber, SEED + offset + k)
-            pv.append(scaled_to_vehicles(m.predict(X_val_seq, verbose=0)[:, 0], j))
-            pt.append(scaled_to_vehicles(m.predict(X_test_seq, verbose=0)[:, 0], j))
+            m = fit_specialist(j, sensor, weighted, huber, residual, SEED + offset + k)
+            pv.append(to_vehicles(m.predict(X_val_seq, verbose=0)[:, 0], j, "val", residual))
+            pt.append(to_vehicles(m.predict(X_test_seq, verbose=0)[:, 0], j, "test", residual))
             del m
         veh_val[name] = np.mean(pv, axis=0)
         veh_test[name] = np.mean(pt, axis=0)
     members = list(veh_val)
+    veh_val["blend-huber"] = np.mean([veh_val["weighted-huber"], veh_val["residual-huber"]], axis=0)
+    veh_test["blend-huber"] = np.mean([veh_test["weighted-huber"], veh_test["residual-huber"]], axis=0)
     veh_val["ensemble"] = np.mean([veh_val[k] for k in members], axis=0)
     veh_test["ensemble"] = np.mean([veh_test[k] for k in members], axis=0)
 
@@ -480,11 +532,16 @@ for i, s in enumerate(SENSORS):
 test_times = test_raw["datetime"].to_numpy()[test_end]
 for sensor in SPECIALIST_SENSORS:
     j = SENSORS.index(sensor)
-    worst = np.argsort(-np.abs(y_true[:, j] - y_pred_final[:, j]))[:8]
-    print(f"\nWorst 8 test windows for {sensor} (target hour | actual | LSTM | persistence):")
+    abs_err = np.abs(y_true[:, j] - y_pred_final[:, j])
+    worst = np.argsort(-abs_err)[:8]
+    share = 100 * np.sum(abs_err[worst] ** 2) / np.sum(abs_err ** 2)
+    print(f"\nWorst 8 test windows for {sensor} = {share:.1f}% of its total squared error")
+    print("(target hour | actual | LSTM | persistence | actual flow of every sensor at that hour)")
+    print("If B and C spiked too it was real traffic; if only this sensor did, suspect the sensor.")
     for w in worst:
         t = pd.Timestamp(test_times[w]) + pd.Timedelta(hours=HORIZON)
-        print(f"  {t} | {y_true[w, j]:7.1f} | {y_pred_final[w, j]:7.1f} | {persist_pred[w, j]:7.1f}")
+        others = "  ".join(f"{s.split('_')[-1]}={y_true[w, i]:.0f}" for i, s in enumerate(SENSORS))
+        print(f"  {t} | {y_true[w, j]:7.1f} | {y_pred_final[w, j]:7.1f} | {persist_pred[w, j]:7.1f} | {others}")
 
 # ----------------------------------------------------------------------------
 # Next steps if the LSTM doesn't clearly beat the baselines above:
