@@ -353,8 +353,62 @@ def to_vehicles(out, j, split, residual):
     return scaled_to_vehicles(out, j)
 
 
-def build_single_model(window, n_features, name, huber):
-    inputs = layers.Input(shape=(window, n_features))
+# ---------------------------------------------------------------------------
+# NEW: neighbor-divergence feature, specialist-only.
+#
+# Why: cross-referencing D's worst windows against B/C's flow at the same
+# hour (2023-08-04 12:00: B=15 C=105 D=0; 2023-08-06 12:00: B=24 C=104 D=2)
+# shows C surging while D empties on the SAME hour, twice. D correlates
+# POSITIVELY with B/C on ~92-94% of hours, so `neighbor_mean` alone can't
+# distinguish "both neighbors calm" from "one spiking while the other stays
+# flat" -- exactly the diversion signature above. std(B, C) at each hour
+# captures that spread; the model gets it as a full 48-hour channel (not just
+# the latest hour) so it can also learn what rising divergence looks like in
+# the hours leading up to one of these events.
+#
+# This is NEW COLUMNS APPENDED to a COPY of the window tensor used only by
+# the D specialists below -- FEATURE_COLS, X_train_seq/X_val_seq/X_test_seq,
+# and the shared 3-output model are never touched, so B and C's model and
+# predictions are bit-for-bit identical to before this change.
+# ---------------------------------------------------------------------------
+def window_series(raw_series, end_idx, window):
+    """Same windowing rule as make_sequences(), for a single 1-D series."""
+    vals = raw_series.astype(np.float32)
+    return np.stack([vals[e - window + 1:e + 1] for e in end_idx])[..., None]
+
+
+def neighbor_divergence_window(sensor, split_raw, end_idx):
+    others = [s for s in SENSORS if s != sensor]
+    divergence = split_raw[others].std(axis=1).to_numpy()   # log1p space, per hour
+    return window_series(divergence, end_idx, WINDOW)
+
+
+divergence_window = {}
+for sensor in SPECIALIST_SENSORS:
+    divergence_window[sensor] = {
+        "train": neighbor_divergence_window(sensor, train_raw, train_end_idx),
+        "val": neighbor_divergence_window(sensor, val_raw, val_end_idx),
+        "test": neighbor_divergence_window(sensor, test_raw, test_end),
+    }
+    # Standardize using TRAIN stats only, same discipline as feature_scaler.
+    div_mean = divergence_window[sensor]["train"].mean()
+    div_std = divergence_window[sensor]["train"].std() + 1e-8
+    for split in ("train", "val", "test"):
+        divergence_window[sensor][split] = (divergence_window[sensor][split] - div_mean) / div_std
+
+
+def augmented_inputs(sensor, split, use_divergence):
+    """X_train_seq/X_val_seq/X_test_seq for `split`, with the divergence
+    channel appended when use_divergence is True. Returns the PLAIN arrays
+    unmodified when False -- same object, no copy, no risk to existing code."""
+    base = {"train": X_train_seq, "val": X_val_seq, "test": X_test_seq}[split]
+    if not use_divergence:
+        return base
+    return np.concatenate([base, divergence_window[sensor][split]], axis=-1)
+
+
+def build_single_model(window, n_features, name, huber, extra_features=0):
+    inputs = layers.Input(shape=(window, n_features + extra_features))
     x = layers.LSTM(64, return_sequences=True)(inputs)
     x = layers.LayerNormalization()(x)
     x = layers.Dropout(0.2)(x)
@@ -369,9 +423,12 @@ def build_single_model(window, n_features, name, huber):
     return m
 
 
-def fit_specialist(j, sensor, weighted, huber, residual, seed):
+def fit_specialist(j, sensor, weighted, huber, residual, seed, use_divergence=False):
     tf.keras.utils.set_random_seed(seed)
-    m = build_single_model(WINDOW, n_features, sensor, huber)
+    m = build_single_model(WINDOW, n_features, sensor, huber,
+                            extra_features=1 if use_divergence else 0)
+    Xtr = augmented_inputs(sensor, "train", use_divergence)
+    Xva = augmented_inputs(sensor, "val", use_divergence)
     if residual:
         ytr = ((tgt_log["train"][:, j] - now_log["train"][:, j] - res_mean[j]) / res_std[j])[:, None]
         yva = ((tgt_log["val"][:, j] - now_log["val"][:, j] - res_mean[j]) / res_std[j])[:, None]
@@ -381,30 +438,35 @@ def fit_specialist(j, sensor, weighted, huber, residual, seed):
         w_tr = np.expm1(target_scaler.inverse_transform(y_train_seq))[:, j] + 1.0
         w_va = np.expm1(target_scaler.inverse_transform(y_val_seq))[:, j] + 1.0
         norm = w_tr.mean()                      # train mean for both, so scales match
-        val_data = (X_val_seq, yva, w_va / norm)
+        val_data = (Xva, yva, w_va / norm)
         fit_kwargs = {"sample_weight": w_tr / norm}
     else:
-        val_data = (X_val_seq, yva)
+        val_data = (Xva, yva)
         fit_kwargs = {}
     cbs = [
         callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True),
         callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6),
     ]
-    h = m.fit(X_train_seq, ytr, validation_data=val_data, epochs=EPOCHS,
+    h = m.fit(Xtr, ytr, validation_data=val_data, epochs=EPOCHS,
               batch_size=BATCH_SIZE, callbacks=cbs, verbose=0, **fit_kwargs)
-    tag = ("weighted " if weighted else "") + ("huber " if huber else "") + ("residual " if residual else "")
+    tag = ("weighted " if weighted else "") + ("huber " if huber else "") + \
+          ("residual " if residual else "") + ("div " if use_divergence else "")
     print(f"  trained {tag}specialist for {sensor} (seed {seed}): "
           f"{len(h.history['loss'])} epochs, best val_loss {min(h.history['val_loss']):.4f}")
     return m
 
 
-# name, flow-weighted?, huber?, residual?, seed offset, number of seeds averaged
-# (seed offsets 1, 2 and 12 are the same seeds as the previous version of this script)
+# name, flow-weighted?, huber?, residual?, seed offset, number of seeds averaged, use_divergence?
+# (seed offsets 1, 2, 12 and 22 are the same seeds as the previous version of this script;
+#  the two "-div" variants use fresh offsets so they train independent networks,
+#  not the same weights as their non-div counterparts.)
 SPECIALIST_VARIANTS = [
-    ("specialist",     False, False, False, 1,  1),
-    ("weighted",       True,  False, False, 2,  SPECIALIST_SEEDS),
-    ("weighted-huber", True,  True,  False, 12, SPECIALIST_SEEDS),
-    ("residual-huber", True,  True,  True,  22, SPECIALIST_SEEDS),
+    ("specialist",         False, False, False, 1,  1,                False),
+    ("weighted",           True,  False, False, 2,  SPECIALIST_SEEDS, False),
+    ("weighted-huber",     True,  True,  False, 12, SPECIALIST_SEEDS, False),
+    ("residual-huber",     True,  True,  True,  22, SPECIALIST_SEEDS, False),
+    ("weighted-huber-div", True,  True,  False, 32, SPECIALIST_SEEDS, True),
+    ("residual-huber-div", True,  True,  True,  42, SPECIALIST_SEEDS, True),
 ]
 
 y_val_true = np.expm1(target_scaler.inverse_transform(y_val_seq))
@@ -416,18 +478,23 @@ for sensor in SPECIALIST_SENSORS:
     print(f"\nDedicated models for {sensor}:")
     veh_val = {"multi-output": scaled_to_vehicles(val_pred_scaled[:, j], j)}
     veh_test = {"multi-output": scaled_to_vehicles(y_pred_scaled[:, j], j)}
-    for name, weighted, huber, residual, offset, n_seeds in SPECIALIST_VARIANTS:
+    for name, weighted, huber, residual, offset, n_seeds, use_divergence in SPECIALIST_VARIANTS:
+        Xva_pred = augmented_inputs(sensor, "val", use_divergence)
+        Xte_pred = augmented_inputs(sensor, "test", use_divergence)
         pv, pt = [], []
         for k in range(n_seeds):
-            m = fit_specialist(j, sensor, weighted, huber, residual, SEED + offset + k)
-            pv.append(to_vehicles(m.predict(X_val_seq, verbose=0)[:, 0], j, "val", residual))
-            pt.append(to_vehicles(m.predict(X_test_seq, verbose=0)[:, 0], j, "test", residual))
+            m = fit_specialist(j, sensor, weighted, huber, residual, SEED + offset + k, use_divergence)
+            pv.append(to_vehicles(m.predict(Xva_pred, verbose=0)[:, 0], j, "val", residual))
+            pt.append(to_vehicles(m.predict(Xte_pred, verbose=0)[:, 0], j, "test", residual))
             del m
         veh_val[name] = np.mean(pv, axis=0)
         veh_test[name] = np.mean(pt, axis=0)
     members = list(veh_val)
     veh_val["blend-huber"] = np.mean([veh_val["weighted-huber"], veh_val["residual-huber"]], axis=0)
     veh_test["blend-huber"] = np.mean([veh_test["weighted-huber"], veh_test["residual-huber"]], axis=0)
+    veh_val["blend-huber-div"] = np.mean([veh_val["weighted-huber-div"], veh_val["residual-huber-div"]], axis=0)
+    veh_test["blend-huber-div"] = np.mean([veh_test["weighted-huber-div"], veh_test["residual-huber-div"]], axis=0)
+    members = list(veh_val)   # refresh to include the two new blends in "ensemble" below
     veh_val["ensemble"] = np.mean([veh_val[k] for k in members], axis=0)
     veh_test["ensemble"] = np.mean([veh_test[k] for k in members], axis=0)
 
