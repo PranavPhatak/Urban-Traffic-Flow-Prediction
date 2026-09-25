@@ -1,18 +1,3 @@
-"""
-Streamlit UI for the GD0501 urban traffic-flow forecaster.
-
-Only a CSV-upload flow is offered here (no "manual entry" tab): the model
-needs a contiguous, hourly window of history (WINDOW + 24 hours, see
-/health) to correctly compute rolling-std and neighbor-mean features --
-typing 70+ hourly rows by hand isn't practical, and a single hand-entered
-row can't be padded into something meaningful the way a single sensor
-cycle sort-of could in a simpler model.
-
-Run with:
-    streamlit run streamlit_app.py
-(and, in another terminal): uvicorn api:app --reload --port 8000
-"""
-
 import os
 from datetime import datetime, timedelta
 
@@ -27,9 +12,6 @@ st.set_page_config(page_title="Traffic Flow Forecaster", page_icon="🚦", layou
 st.title("🚦 GD0501 Traffic Flow Forecaster")
 st.caption("LSTM · 1-hour-ahead vehicle flow · sensors B, C, D")
 
-# ------------------------------------------------------------------
-# Sidebar: API status
-# ------------------------------------------------------------------
 with st.sidebar:
     st.subheader("API status")
     health = None
@@ -73,9 +55,6 @@ st.write(
 
 uploaded = st.file_uploader("Traffic history CSV", type=["csv"])
 
-# ------------------------------------------------------------------
-# Optional: generate a synthetic template so the format is obvious
-# ------------------------------------------------------------------
 with st.expander("Don't have a CSV handy? Download a synthetic template"):
     st.caption(
         "This is randomly generated data purely to show the expected shape and "

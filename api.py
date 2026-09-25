@@ -1,32 +1,3 @@
-"""
-FastAPI backend for the GD0501 urban traffic-flow forecaster.
-
-Mirrors the exact pipeline in 01_data_cleaning.py -> 02_feature_engineering.py
--> 03_train_lstm.py:
-
-  - Flow columns are log1p-transformed before anything else is derived.
-  - Per-sensor rolling std (24h, using only the PAST 24 hours -- shift(1)
-    before .rolling(24)) and the contemporaneous mean of the OTHER sensors
-    ("neighbor_mean") are engineered features, not raw inputs.
-  - Calendar features are sin/cos-encoded hour/day-of-week/month + is_weekend.
-  - A 48-hour window (WINDOW) of those features predicts each sensor's flow
-    HORIZON hours ahead.
-  - B and C only ever have the shared 3-output model. D may have a
-    dedicated "specialist" model instead, IF one beat the shared model on
-    validation RMSE during training -- 03_train_lstm.py records which one won
-    in specialists/<sensor>/manifest.json, and this API reads that manifest
-    at startup rather than hardcoding a winner, so it keeps working correctly
-    after every retrain even if a different candidate wins next time.
-
-This file makes NO assumptions about which sensor has a specialist or which
-candidate won -- FEATURE_COLS, SENSORS, WINDOW and HORIZON are all read back
-from the saved scalers / manifests themselves, so they can never drift out of
-sync with what was actually trained.
-
-Run with:
-    uvicorn api:app --reload --port 8000
-"""
-
 import os
 from datetime import timedelta
 from pathlib import Path
@@ -40,24 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from tensorflow.keras.models import load_model
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-# Point this at the `models/` folder 03_train_lstm.py wrote to
-# (shared_multioutput_lstm.keras, feature_scaler.pkl, target_scaler.pkl,
-# training_summary.json, and optionally specialists/<sensor>/...).
 MODELS_DIR = Path(os.environ.get("TRAFFIC_MODELS_DIR", "./models")).resolve()
 
-ROLLING_STD_WINDOW = 24  # MUST match ROLLING_STD_WINDOW in 02_feature_engineering.py
+ROLLING_STD_WINDOW = 24 
 
 
 def _resolve_model_path(rel_path: str) -> Path:
-    """A manifest's seed_model_paths are relative to MODELS_DIR and may use
-    either '/' or the Windows '\\' they were saved with. Try that path as-is
-    first; if the folder structure got flattened (e.g. after re-uploading
-    just the files), fall back to looking for the same filename directly
-    under MODELS_DIR."""
     normalized = rel_path.replace("\\", "/")
     candidate = MODELS_DIR / normalized
     if candidate.exists():
@@ -69,11 +28,6 @@ def _resolve_model_path(rel_path: str) -> Path:
         f"Could not find model file for '{rel_path}' at {candidate} or {flat}"
     )
 
-
-# ============================================================
-# LOAD ARTIFACTS ONCE AT STARTUP
-# ============================================================
-
 app = FastAPI(
     title="GD0501 Traffic Flow Forecast API",
     description="1-hour-ahead vehicle-flow forecasts for sensors GD0501_B/C/D.",
@@ -84,7 +38,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 _shared_model = None
 _feature_scaler = None
 _target_scaler = None
-_specialists: Dict[str, dict] = {}     # sensor -> {"manifest": ..., "leaf_models": {leaf: [model,...]}}
+_specialists: Dict[str, dict] = {}     
 SENSORS: List[str] = []
 FEATURE_COLS: List[str] = []
 WINDOW = None
@@ -97,12 +51,10 @@ try:
     _feature_scaler = joblib.load(MODELS_DIR / "feature_scaler.pkl")
     _target_scaler = joblib.load(MODELS_DIR / "target_scaler.pkl")
 
-    # Derive config from the artifacts themselves -- never hardcoded, so a
-    # retrain with different features/horizon can't silently go stale here.
     FEATURE_COLS = list(_feature_scaler.feature_names_in_)
     SENSORS = [c[: -len("_target")] for c in _target_scaler.feature_names_in_]
     WINDOW = _shared_model.input_shape[1]
-    HORIZON = 1  # not stored in any artifact; keep in sync with 02_feature_engineering.py's HORIZON
+    HORIZON = 1  
     MIN_HISTORY_HOURS = WINDOW + ROLLING_STD_WINDOW
 
     specialists_dir = MODELS_DIR / "specialists"
@@ -125,13 +77,6 @@ try:
 except Exception as exc:  # noqa: BLE001
     _load_error = f"Failed to load models/scalers: {exc}"
 
-
-# ============================================================
-# FEATURE ENGINEERING (mirrors 02_feature_engineering.py exactly,
-# minus COVID exclusion / segment_id / target creation, which don't apply
-# to a single live contiguous window)
-# ============================================================
-
 def _validate_contiguous_hourly(dt: pd.Series) -> None:
     gaps = dt.diff().iloc[1:]
     if not (gaps == pd.Timedelta(hours=1)).all():
@@ -146,14 +91,10 @@ def _validate_contiguous_hourly(dt: pd.Series) -> None:
 
 
 def build_feature_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """raw_df: columns ['datetime'] + SENSORS, RAW (non-log) vehicle counts,
-    already sorted ascending and hourly-contiguous. Returns a frame with all
-    of FEATURE_COLS plus the log1p'd raw SENSORS columns, with the first
-    ROLLING_STD_WINDOW rows dropped (rolling-std warmup, same as step 02)."""
     df = raw_df.sort_values("datetime").reset_index(drop=True).copy()
     _validate_contiguous_hourly(df["datetime"])
 
-    df[SENSORS] = np.log1p(df[SENSORS])  # log space from here on, same as 02
+    df[SENSORS] = np.log1p(df[SENSORS])
 
     for sensor in SENSORS:
         df[f"{sensor}_rolling_std_24"] = df[sensor].shift(1).rolling(ROLLING_STD_WINDOW).std()
@@ -173,31 +114,21 @@ def build_feature_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
     df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
     df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
 
-    df = df.dropna().reset_index(drop=True)  # rolling-std warmup rows
+    df = df.dropna().reset_index(drop=True) 
     return df
 
 
 def scaled_to_vehicles(y_scaled: float, j: int) -> float:
-    """Inverse of target_scaler for column j, then back out of log1p space.
-    Matches scaled_to_vehicles() in 03_train_lstm.py exactly."""
     log_val = y_scaled * _target_scaler.scale_[j] + _target_scaler.mean_[j]
     return float(np.clip(np.expm1(log_val), 0, None))
 
 
 def residual_to_vehicles(delta_scaled: float, now_log: float, res_mean: float, res_std: float) -> float:
-    """Inverse of a residual-model output: the network predicts the
-    standardized CHANGE from the latest known hour, not the absolute level.
-    Matches to_vehicles(..., residual=True) in 03_train_lstm.py."""
     log_pred = now_log + delta_scaled * res_std + res_mean
     return float(np.clip(np.expm1(log_pred), 0, None))
 
-
-# ============================================================
-# SCHEMAS
-# ============================================================
-
 class HourlyRecord(BaseModel):
-    datetime: str  # ISO-8601, e.g. "2023-08-04T12:00:00"
+    datetime: str 
     values: Dict[str, float] = Field(..., description="One entry per sensor, e.g. {'GD0501_B': 42.0, ...}")
 
 
@@ -232,11 +163,6 @@ class HealthResponse(BaseModel):
     specialist_sensors: List[str]
     error: Optional[str] = None
 
-
-# ============================================================
-# CORE PREDICTION LOGIC
-# ============================================================
-
 def _predict_from_frame(feat_df: pd.DataFrame, raw_hours_count: int) -> PredictResponse:
     if len(feat_df) < WINDOW:
         raise HTTPException(
@@ -251,8 +177,8 @@ def _predict_from_frame(feat_df: pd.DataFrame, raw_hours_count: int) -> PredictR
     X_scaled = _feature_scaler.transform(window_df[FEATURE_COLS]).astype(np.float32)
     X_scaled = X_scaled.reshape(1, WINDOW, len(FEATURE_COLS))
 
-    shared_scaled_out = _shared_model.predict(X_scaled, verbose=0)[0]  # (n_sensors,)
-    raw_log_window = window_df[SENSORS].to_numpy(dtype=np.float32)     # (WINDOW, n_sensors), log1p space
+    shared_scaled_out = _shared_model.predict(X_scaled, verbose=0)[0] 
+    raw_log_window = window_df[SENSORS].to_numpy(dtype=np.float32)     
 
     predictions: Dict[str, SensorPrediction] = {}
     for j, sensor in enumerate(SENSORS):
@@ -267,7 +193,7 @@ def _predict_from_frame(feat_df: pd.DataFrame, raw_hours_count: int) -> PredictR
 
         manifest = _specialists[sensor]["manifest"]
         leaf_models = _specialists[sensor]["leaf_models"]
-        now_log = float(raw_log_window[-1, j])   # latest known hour, this sensor, log1p space
+        now_log = float(raw_log_window[-1, j])   
         res_stats = manifest.get("residual_stats")
         div_stats = manifest.get("divergence_stats")
 
@@ -283,7 +209,7 @@ def _predict_from_frame(feat_df: pd.DataFrame, raw_hours_count: int) -> PredictR
             if comp["use_divergence"]:
                 others = [s for s in SENSORS if s != sensor]
                 other_idx = [SENSORS.index(s) for s in others]
-                divergence = raw_log_window[:, other_idx].std(axis=1)  # (WINDOW,)
+                divergence = raw_log_window[:, other_idx].std(axis=1)  
                 divergence = (divergence - div_stats["mean"]) / div_stats["std"]
                 X_leaf = np.concatenate(
                     [X_scaled, divergence.reshape(1, WINDOW, 1).astype(np.float32)], axis=-1
@@ -313,11 +239,6 @@ def _predict_from_frame(feat_df: pd.DataFrame, raw_hours_count: int) -> PredictR
         hours_used_in_window=WINDOW,
     )
 
-
-# ============================================================
-# ROUTES
-# ============================================================
-
 @app.get("/health", response_model=HealthResponse)
 def health():
     return HealthResponse(
@@ -333,7 +254,6 @@ def health():
 
 @app.get("/manifest")
 def manifest():
-    """Which model actually won for each sensor, and its saved metrics."""
     summary_path = MODELS_DIR / "training_summary.json"
     if not summary_path.exists():
         raise HTTPException(status_code=404, detail="training_summary.json not found in MODELS_DIR")
@@ -368,9 +288,6 @@ def predict(req: PredictRequest):
 
 @app.post("/predict_csv", response_model=PredictResponse)
 def predict_csv(rows: List[dict]):
-    """Convenience endpoint for a CSV parsed into row dicts, each with a
-    'datetime' key and one key per sensor (raw vehicle counts). Extra columns
-    are ignored."""
     if _load_error is not None:
         raise HTTPException(status_code=503, detail=_load_error)
 

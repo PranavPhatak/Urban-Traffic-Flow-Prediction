@@ -1,53 +1,3 @@
-"""
-Step 3: Multi-output LSTM for GD0501 intersection traffic-flow forecasting.
-
-Reads dataset/processed/GD0501_features.csv (output of 02_feature_engineering.py).
-Predicts sensors GD0501_B, GD0501_C, GD0501_D jointly (one model, 3 outputs)
-since they're the same intersection and correlated.
-
-Key correctness points carried over from cleaning/feature-engineering:
-- `segment_id` marks contiguous true-hourly runs. Sequence windows are only
-  built from rows that share one segment_id, so a window never silently spans
-  a data gap (the longest gap in this dataset is 35 days).
-- Chronological split (train / val / test by date), not random.
-- Scaler fit on train only.
-
-FIXED in this version (the reason the baseline looked "too low"):
-- OFF-BY-ONE in window construction. In 02_feature_engineering.py, row i holds
-  the flow at hour t_i and `<sensor>_target` on that row is the flow at
-  t_i + HORIZON. The old make_sequences() fed rows [i-WINDOW, i) as input but
-  used targets[i] as the label -- so the newest hour the model was allowed to
-  see was t_{i-1} while the label was t_i + 1: a 2-HOUR-ahead forecast, not the
-  1-hour horizon the config says. The persistence baseline (raw_vals[idx-1])
-  had the same 2-hour gap, so it was being scored on a harder task than
-  intended, which is why its R2 (0.47-0.59) sat far below what lag-1
-  autocorrelation of 0.84-0.89 implies (R2 ~ 0.7-0.8).
-  Now the window is rows [i-WINDOW+1, i] (INCLUDING row i, the latest known
-  hour) and the label is targets[i] -> a true HORIZON-hour-ahead forecast.
-- The baseline is now evaluated on EXACTLY the same test windows as the LSTM
-  (previously it used a looser filter and a different sample set).
-- Added a seasonal-naive baseline (same hour yesterday). Traffic has a strong
-  daily cycle, and persistence ignores it while the LSTM gets hour/day/month
-  features, so persistence alone is a weak yardstick.
-- Added sanity checks that fail loudly if targets, windows or the scaler
-  inversion are misaligned.
-- Stronger baselines (profile-adjusted persistence, Ridge on the same windows),
-  all fit on train only. They sit AFTER training/evaluation of the LSTM and do
-  not touch the model, data, seed or training loop, so LSTM results are
-  unchanged by them.
-- GD0501_D (the hardest sensor) gets dedicated single-sensor models trained
-  AFTER the original 3-output model, and the final D prediction is whichever
-  candidate has the best VALIDATION RMSE. The original 3-output model is
-  trained exactly as before, and the B and C columns are never replaced, so
-  their predictions/metrics are unchanged.
-- The D candidates now include seed-averaged, flow-weighted and Huber-loss
-  specialists (Huber limits the pull of unpredictable one-off surges/dropouts).
-- A residual specialist for D that forecasts the CHANGE from the latest hour, so
-  an unusual level (e.g. a busy night) is carried forward instead of being
-  pulled back to the usual value for that hour. Chosen only if it wins on
-  validation.
-"""
-
 from pathlib import Path
 import json
 from datetime import datetime, timezone
@@ -61,19 +11,16 @@ from sklearn.linear_model import Ridge
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks
 
-# ----------------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------------
 PROCESSED_DIR = Path("../dataset/processed")
 MODELS_DIR = Path("../models")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 SENSORS = ["GD0501_B", "GD0501_C", "GD0501_D"]
-HORIZON = 1          # hours ahead. MUST equal HORIZON in 02_feature_engineering.py
-WINDOW = 48          # hours of history fed to the LSTM per prediction
-SEASONAL_LAG = 24    # "same hour yesterday" baseline
-RIDGE_ALPHAS = [1, 10, 100, 1000, 10000]   # picked on VAL, never on test
-SPECIALIST_SENSORS = ["GD0501_D"]   # sensors that also get a dedicated model (B/C left untouched)
-SPECIALIST_SEEDS = 3                  # networks averaged per weighted variant (more = steadier, slower)
+HORIZON = 1          
+WINDOW = 48         
+SEASONAL_LAG = 24    
+RIDGE_ALPHAS = [1, 10, 100, 1000, 10000]   
+SPECIALIST_SENSORS = ["GD0501_D"]   
+SPECIALIST_SEEDS = 3                  
 VAL_FRAC = 0.15
 TEST_FRAC = 0.15
 BATCH_SIZE = 64
@@ -83,11 +30,8 @@ SEED = 42
 assert HORIZON < SEASONAL_LAG, "seasonal baseline needs HORIZON < SEASONAL_LAG"
 assert SEASONAL_LAG - HORIZON <= WINDOW - 1, "WINDOW too short for the seasonal baseline"
 
-tf.keras.utils.set_random_seed(SEED)   # seeds python, numpy and tensorflow
+tf.keras.utils.set_random_seed(SEED)   
 
-# ----------------------------------------------------------------------------
-# 1. Load engineered features
-# ----------------------------------------------------------------------------
 df = pd.read_csv(PROCESSED_DIR / "GD0501_features.csv", parse_dates=["datetime"])
 df = df.sort_values("datetime").reset_index(drop=True)
 
@@ -98,11 +42,6 @@ print(f"Loaded {len(df):,} rows, {len(FEATURE_COLS)} features, {df['segment_id']
 
 
 def check_target_alignment(frame, horizon):
-    """Verify 02's `<sensor>_target` really is the flow `horizon` hours later.
-
-    For rows i and i+horizon that are in the same segment and exactly
-    `horizon` hours apart, target[i] must equal sensor[i+horizon].
-    """
     dt = frame["datetime"].to_numpy()
     seg = frame["segment_id"].to_numpy()
     ok = np.where(
@@ -125,9 +64,6 @@ def check_target_alignment(frame, horizon):
 
 check_target_alignment(df, HORIZON)
 
-# ----------------------------------------------------------------------------
-# 2. Chronological split by TIME, never randomly shuffled
-# ----------------------------------------------------------------------------
 n = len(df)
 train_end = int(n * (1 - VAL_FRAC - TEST_FRAC))
 val_end = int(n * (1 - TEST_FRAC))
@@ -140,16 +76,10 @@ print(f"Train: {train_df['datetime'].min()} -> {train_df['datetime'].max()}  ({l
 print(f"Val:   {val_df['datetime'].min()} -> {val_df['datetime'].max()}  ({len(val_df)} rows)")
 print(f"Test:  {test_df['datetime'].min()} -> {test_df['datetime'].max()}  ({len(test_df)} rows)")
 
-# Keep an UNSCALED copy of the test split (log1p space, as written by step 02).
-# Baselines and the ground truth are taken from this, so they never depend on
-# the scaler.
 test_raw = test_df.reset_index(drop=True)
-train_raw = train_df.reset_index(drop=True)   # for the train-only baselines below
+train_raw = train_df.reset_index(drop=True)   
 val_raw = val_df.reset_index(drop=True)
 
-# ----------------------------------------------------------------------------
-# 3. Scale -- fit ONLY on train
-# ----------------------------------------------------------------------------
 feature_scaler = StandardScaler().fit(train_df[FEATURE_COLS])
 target_scaler = StandardScaler().fit(train_df[TARGET_COLS])
 
@@ -157,19 +87,6 @@ for split_df in (train_df, val_df, test_df):
     split_df[FEATURE_COLS] = feature_scaler.transform(split_df[FEATURE_COLS])
     split_df[TARGET_COLS] = target_scaler.transform(split_df[TARGET_COLS])
 
-# ----------------------------------------------------------------------------
-# 4. Windowing -- segment-aware and correctly aligned.
-#
-#    A sample ends at row e:
-#        input  = feature rows [e-WINDOW+1 ... e]   (INCLUDES row e, the latest
-#                                                    hour we know about)
-#        label  = targets[e]                        (flow at t_e + HORIZON)
-#
-#    The window is kept only if all its rows share one segment_id AND span
-#    exactly WINDOW-1 hours, i.e. it is truly contiguous hourly data. The
-#    label row is guaranteed to be in the same segment: step 02 dropped every
-#    row whose target crossed a segment boundary.
-# ----------------------------------------------------------------------------
 def make_sequences(split_df, window):
     feats = split_df[FEATURE_COLS].to_numpy(dtype=np.float32)
     targets = split_df[TARGET_COLS].to_numpy(dtype=np.float32)
@@ -200,15 +117,9 @@ print(f"\nSequence shapes -> train: {X_train_seq.shape}, val: {X_val_seq.shape},
 n_features = X_train_seq.shape[2]
 n_outputs = len(TARGET_COLS)
 
-# ----------------------------------------------------------------------------
-# 5. Model -- 2 stacked LSTM layers, ordinary Dropout (not recurrent_dropout,
-#    which disables cuDNN), LayerNormalization instead of BatchNormalization
-#    (BatchNorm inside a recurrent stack is a known failure mode).
-# ----------------------------------------------------------------------------
 def build_model(window, n_features, n_outputs, sensor_names):
     inputs = layers.Input(shape=(window, n_features))
 
-    # Shared trunk -- learns the common temporal structure across all 3 sensors.
     x = layers.LSTM(64, return_sequences=True)(inputs)
     x = layers.LayerNormalization()(x)
     x = layers.Dropout(0.2)(x)
@@ -217,7 +128,6 @@ def build_model(window, n_features, n_outputs, sensor_names):
     x = layers.LayerNormalization()(x)
     x = layers.Dropout(0.2)(x)
 
-    # Per-sensor output heads (small: 8 units each).
     head_outputs = []
     for name in sensor_names:
         h = layers.Dense(8, activation="relu", name=f"{name}_head")(x)
@@ -238,9 +148,6 @@ def build_model(window, n_features, n_outputs, sensor_names):
 model = build_model(WINDOW, n_features, n_outputs, SENSORS)
 model.summary()
 
-# ----------------------------------------------------------------------------
-# 6. Train with early stopping on val loss
-# ----------------------------------------------------------------------------
 early_stop = callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)
 reduce_lr = callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6)
 
@@ -253,15 +160,6 @@ history = model.fit(
     verbose=2,
 )
 
-# ----------------------------------------------------------------------------
-# 6b. Persist the shared model + scalers now. EarlyStopping above used
-#     restore_best_weights=True, so `model` already holds the weights from
-#     its best-val-loss epoch, not the last epoch trained -- saving here
-#     captures exactly that checkpoint. B and C have no other candidate model
-#     (SPECIALIST_SENSORS never touches them), so this file IS their final
-#     saved model; for D it's also the "multi-output" candidate in the
-#     selection below.
-# ----------------------------------------------------------------------------
 SHARED_MODEL_PATH = MODELS_DIR / "shared_multioutput_lstm.keras"
 model.save(SHARED_MODEL_PATH)
 joblib.dump(feature_scaler, MODELS_DIR / "feature_scaler.pkl")
@@ -269,9 +167,6 @@ joblib.dump(target_scaler, MODELS_DIR / "target_scaler.pkl")
 print(f"\nSaved shared multi-output model (best val_loss checkpoint) -> {SHARED_MODEL_PATH}")
 print(f"Saved feature/target scalers -> {MODELS_DIR}")
 
-# ----------------------------------------------------------------------------
-# 7. Evaluate everything on the SAME test windows, in real vehicles/hour
-# ----------------------------------------------------------------------------
 def evaluate(label, y_true, y_pred):
     print(f"\n{label}")
     out = {}
@@ -286,67 +181,20 @@ def evaluate(label, y_true, y_pred):
         out[s] = {"mae": mae, "rmse": rmse, "r2": r2, "wape": wape}
     return out
 
-
-# Ground truth straight from the unscaled log1p targets (independent of the
-# scaler), inverted back to vehicles/hour.
 y_true = np.expm1(test_raw[TARGET_COLS].to_numpy()[test_end])
 
-# LSTM: scaled -> log1p space -> vehicles/hour (clipped: flow can't be negative)
 y_pred_scaled = model.predict(X_test_seq, verbose=0)
 y_pred_log = target_scaler.inverse_transform(y_pred_scaled)
 y_pred = np.clip(np.expm1(y_pred_log), 0, None)
 
-# Sanity check: labels that went through the scaler round-trip must match the
-# raw ground truth, otherwise windows and targets are misaligned.
 y_true_from_scaler = np.expm1(target_scaler.inverse_transform(y_test_seq))
 assert np.allclose(y_true, y_true_from_scaler, rtol=1e-3, atol=1e-2), \
     "Test labels do not match raw targets -- window/target misalignment"
 
-# ---------------------------------------------------------------------------
-# 7a. Dedicated models for the weakest sensor(s).
-#
-# Why separate models instead of changing the shared one: any change to the
-# 3-output network (size, loss, weights) changes the random init/gradients for
-# B and C too. Extra models trained AFTER it leave B and C bit-for-bit the same,
-# and the original model's D output stays in the running as a candidate.
-#
-# Candidates, all judged on VALIDATION real-unit RMSE (test is printed for
-# information only and never used to choose):
-#   multi-output   : D output of the original 3-output model
-#   specialist     : 1 single-output model (same trunk, dedicated head), plain MSE
-#   weighted       : mean of SPECIALIST_SEEDS specialists trained with a
-#       flow-weighted loss. Training is in log1p space, where a 2-vs-5 vehicle
-#       error at 3am costs as much as 200-vs-500 at rush hour, yet MAE/RMSE are
-#       in vehicles/hr. Since d(vehicles) ~ (v+1) * d(log1p v), weighting by
-#       (v+1) pulls the objective toward the metric we report.
-#   weighted-huber : same, with a HUBER loss so a few unpredictable targets
-#       (one-off surges, sensor dropouts) cannot dominate the gradient.
-#   residual-huber : NEW. Same loss, but the network predicts the CHANGE from
-#       the latest observed hour instead of the absolute level:
-#           log1p(flow at t+H) = log1p(flow at t) + network output
-#       Why: D's worst test windows are a night-time surge (31 May - 2 Jun,
-#       63-173 veh/hr at 00:00-03:00). The direct models answered ~6 veh/hr
-#       even when the hour they had just seen was 143, because "night = quiet"
-#       is baked into their weights and a busy night is out of distribution for
-#       them. With the residual form the forecast starts from what was just
-#       observed and the network only has to learn the typical change, which is
-#       small at night, so an out-of-distribution level is carried through
-#       (persistence-like) instead of being pulled back to the usual night value.
-#   blend-huber    : mean of weighted-huber and residual-huber
-#   ensemble       : mean of the five models above
-#
-# Seed-averaging cuts the run-to-run noise of a single network. All averaging
-# is done in vehicles/hour (not log space), which avoids the downward bias of
-# averaging log-predictions before expm1.
-# ---------------------------------------------------------------------------
 def scaled_to_vehicles(y_scaled, j):
-    """One target column: scaled -> log1p space -> vehicles/hour (>= 0)."""
+    
     return np.clip(np.expm1(y_scaled * target_scaler.scale_[j] + target_scaler.mean_[j]), 0, None)
 
-
-# Anchors for the residual model, taken from the UNSCALED frames on exactly the
-# rows each window ends at: now_log = log1p flow of the newest hour in the
-# window, tgt_log = log1p flow HORIZON hours later.
 fi = [FEATURE_COLS.index(s) for s in SENSORS]
 now_log = {
     "train": train_raw[SENSORS].to_numpy()[train_end_idx],
@@ -358,61 +206,41 @@ tgt_log = {
     "val": val_raw[TARGET_COLS].to_numpy()[val_end_idx],
     "test": test_raw[TARGET_COLS].to_numpy()[test_end],
 }
-# Sanity check: the anchor must equal the newest hour the network is given.
+
 _newest_input = X_test_seq[:, -1, fi] * feature_scaler.scale_[fi] + feature_scaler.mean_[fi]
 assert np.allclose(_newest_input, now_log["test"], atol=1e-3), \
     "Residual anchor does not match the newest input hour -- window misalignment"
 _delta_train = tgt_log["train"] - now_log["train"]
-res_mean, res_std = _delta_train.mean(axis=0), _delta_train.std(axis=0)   # train stats only
+res_mean, res_std = _delta_train.mean(axis=0), _delta_train.std(axis=0)   
 
 
 def to_vehicles(out, j, split, residual):
-    """Network output -> vehicles/hour for a split ('train'/'val'/'test')."""
+    
     if residual:
         log_pred = now_log[split][:, j] + out * res_std[j] + res_mean[j]
         return np.clip(np.expm1(log_pred), 0, None)
     return scaled_to_vehicles(out, j)
 
-
-# ---------------------------------------------------------------------------
-# NEW: neighbor-divergence feature, specialist-only.
-#
-# Why: cross-referencing D's worst windows against B/C's flow at the same
-# hour (2023-08-04 12:00: B=15 C=105 D=0; 2023-08-06 12:00: B=24 C=104 D=2)
-# shows C surging while D empties on the SAME hour, twice. D correlates
-# POSITIVELY with B/C on ~92-94% of hours, so `neighbor_mean` alone can't
-# distinguish "both neighbors calm" from "one spiking while the other stays
-# flat" -- exactly the diversion signature above. std(B, C) at each hour
-# captures that spread; the model gets it as a full 48-hour channel (not just
-# the latest hour) so it can also learn what rising divergence looks like in
-# the hours leading up to one of these events.
-#
-# This is NEW COLUMNS APPENDED to a COPY of the window tensor used only by
-# the D specialists below -- FEATURE_COLS, X_train_seq/X_val_seq/X_test_seq,
-# and the shared 3-output model are never touched, so B and C's model and
-# predictions are bit-for-bit identical to before this change.
-# ---------------------------------------------------------------------------
 def window_series(raw_series, end_idx, window):
-    """Same windowing rule as make_sequences(), for a single 1-D series."""
     vals = raw_series.astype(np.float32)
     return np.stack([vals[e - window + 1:e + 1] for e in end_idx])[..., None]
 
 
 def neighbor_divergence_window(sensor, split_raw, end_idx):
     others = [s for s in SENSORS if s != sensor]
-    divergence = split_raw[others].std(axis=1).to_numpy()   # log1p space, per hour
+    divergence = split_raw[others].std(axis=1).to_numpy()   
     return window_series(divergence, end_idx, WINDOW)
 
 
 divergence_window = {}
-div_stats = {}   # sensor -> (mean, std), kept so the winning model's manifest can record them
+div_stats = {}   
 for sensor in SPECIALIST_SENSORS:
     divergence_window[sensor] = {
         "train": neighbor_divergence_window(sensor, train_raw, train_end_idx),
         "val": neighbor_divergence_window(sensor, val_raw, val_end_idx),
         "test": neighbor_divergence_window(sensor, test_raw, test_end),
     }
-    # Standardize using TRAIN stats only, same discipline as feature_scaler.
+    
     div_mean = divergence_window[sensor]["train"].mean()
     div_std = divergence_window[sensor]["train"].std() + 1e-8
     div_stats[sensor] = (float(div_mean), float(div_std))
@@ -421,9 +249,7 @@ for sensor in SPECIALIST_SENSORS:
 
 
 def augmented_inputs(sensor, split, use_divergence):
-    """X_train_seq/X_val_seq/X_test_seq for `split`, with the divergence
-    channel appended when use_divergence is True. Returns the PLAIN arrays
-    unmodified when False -- same object, no copy, no risk to existing code."""
+    
     base = {"train": X_train_seq, "val": X_val_seq, "test": X_test_seq}[split]
     if not use_divergence:
         return base
@@ -441,7 +267,7 @@ def build_single_model(window, n_features, name, huber, extra_features=0):
     x = layers.Dense(16, activation="relu", name=f"{name}_head")(x)
     out = layers.Dense(1, activation="linear", name=f"{name}_out")(x)
     m = models.Model(inputs, out, name=f"{name}_specialist")
-    loss = tf.keras.losses.Huber(delta=1.0) if huber else "mse"   # delta in standardised units
+    loss = tf.keras.losses.Huber(delta=1.0) if huber else "mse"   
     m.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss=loss)
     return m
 
@@ -460,7 +286,7 @@ def fit_specialist(j, sensor, weighted, huber, residual, seed, use_divergence=Fa
     if weighted:
         w_tr = np.expm1(target_scaler.inverse_transform(y_train_seq))[:, j] + 1.0
         w_va = np.expm1(target_scaler.inverse_transform(y_val_seq))[:, j] + 1.0
-        norm = w_tr.mean()                      # train mean for both, so scales match
+        norm = w_tr.mean()                      
         val_data = (Xva, yva, w_va / norm)
         fit_kwargs = {"sample_weight": w_tr / norm}
     else:
@@ -478,11 +304,6 @@ def fit_specialist(j, sensor, weighted, huber, residual, seed, use_divergence=Fa
           f"{len(h.history['loss'])} epochs, best val_loss {min(h.history['val_loss']):.4f}")
     return m
 
-
-# name, flow-weighted?, huber?, residual?, seed offset, number of seeds averaged, use_divergence?
-# (seed offsets 1, 2, 12 and 22 are the same seeds as the previous version of this script;
-#  the two "-div" variants use fresh offsets so they train independent networks,
-#  not the same weights as their non-div counterparts.)
 SPECIALIST_VARIANTS = [
     ("specialist",         False, False, False, 1,  1,                False),
     ("weighted",           True,  False, False, 2,  SPECIALIST_SEEDS, False),
@@ -494,21 +315,11 @@ SPECIALIST_VARIANTS = [
 
 y_val_true = np.expm1(target_scaler.inverse_transform(y_val_seq))
 val_pred_scaled = model.predict(X_val_seq, verbose=0)
-y_pred_final = y_pred.copy()          # B/C columns are never modified
-
-# winning candidate name per sensor; defaults to "multi-output" for sensors
-# with no specialist (B, C) -- they only ever have the one shared model.
+y_pred_final = y_pred.copy()          
 chosen_candidate = {s: "multi-output" for s in SENSORS}
 
-# sensor -> variant name -> {"seed_models": [...], "residual": bool, "use_divergence": bool}
-# Populated as each specialist variant trains, so the winning one(s) can be
-# saved to disk below WITHOUT retraining anything.
 trained_models = {}
 
-# blend-* candidates are equal-weight means of two named base variants;
-# "ensemble" (handled separately below, via `members`) is an equal-weight
-# mean of every candidate trained so far. Both need to be expanded down to
-# actual trained models before anything can be saved.
 COMPOSITE_MAP = {
     "blend-huber": ["weighted-huber", "residual-huber"],
     "blend-huber-div": ["weighted-huber-div", "residual-huber-div"],
@@ -516,10 +327,7 @@ COMPOSITE_MAP = {
 
 
 def expand_candidate(name, ensemble_members):
-    """Flatten a (possibly composite) candidate name into {leaf: weight},
-    where each leaf is either 'multi-output' or a SPECIALIST_VARIANTS name
-    with an actual trained model. Composite weights multiply through
-    recursively (blend-huber inside ensemble still gets the right share)."""
+    
     if name == "ensemble":
         subs = ensemble_members
     elif name in COMPOSITE_MAP:
@@ -533,13 +341,8 @@ def expand_candidate(name, ensemble_members):
             result[leaf] = result.get(leaf, 0.0) + w * share
     return result
 
-
 def save_best_specialist(sensor, best_name, ensemble_members, val_rmse_map, veh_test_map, y_true_col, j):
-    """Save exactly the trained model(s) the winning candidate for `sensor`
-    needs -- nothing else -- plus a manifest recording how to recombine them
-    and which preprocessing stats inference must reapply. Not called when
-    best_name == 'multi-output': that model is already saved as
-    SHARED_MODEL_PATH above."""
+    
     leaves = expand_candidate(best_name, ensemble_members)
     sensor_dir = MODELS_DIR / "specialists" / sensor
     sensor_dir.mkdir(parents=True, exist_ok=True)
@@ -634,25 +437,12 @@ for sensor in SPECIALIST_SENSORS:
     else:
         save_best_specialist(sensor, best, members, val_rmse, veh_test, y_true[:, j], j)
 
-# ---------------------------------------------------------------------------
-# Baselines. Every one is scored on the same test windows (test_end) as the
-# LSTM, and everything learned (profile, ridge weights, ridge alpha) uses TRAIN
-# (and VAL for alpha) only -- nothing is tuned on test.
-# ---------------------------------------------------------------------------
-raw_now = test_raw[SENSORS].to_numpy()                      # log1p space
+raw_now = test_raw[SENSORS].to_numpy()                     
 
-# (1) persistence: the latest KNOWN hour (row e, the same row the LSTM sees last)
 persist_pred = np.expm1(raw_now[test_end])
 
-# (2) seasonal naive: flow at the target hour minus 24h = row e-(24-HORIZON),
-#     which is always inside the window
 seasonal_pred = np.expm1(raw_now[test_end - (SEASONAL_LAG - HORIZON)])
 
-
-# (3) profile-adjusted persistence: last known value + the TYPICAL hour-to-hour
-#     change for that hour of the week (learned from train). Plain persistence
-#     is blind to the morning/evening ramps; this keeps its "start from what we
-#     just saw" strength and adds the expected ramp. Done in log1p space.
 def hour_of_week(frame):
     dt = frame["datetime"]
     return (dt.dt.dayofweek * 24 + dt.dt.hour).to_numpy()
@@ -660,7 +450,7 @@ def hour_of_week(frame):
 
 profile = train_raw.groupby(hour_of_week(train_raw))[SENSORS].median().reindex(range(168))
 assert not profile.isna().any().any(), "train split is missing some hour-of-week bins"
-profile = profile.to_numpy()                                # (168, n_sensors)
+profile = profile.to_numpy()                               
 
 how_now = hour_of_week(test_raw)[test_end]
 how_target = (how_now + HORIZON) % 168
@@ -668,9 +458,6 @@ profile_pred = np.clip(
     np.expm1(raw_now[test_end] + profile[how_target] - profile[how_now]), 0, None
 )
 
-# (4) Ridge (linear) on the exact same flattened windows the LSTM gets. This is
-#     the honest "is the recurrent network actually needed?" check. alpha is
-#     chosen on validation.
 Xtr = X_train_seq.reshape(len(X_train_seq), -1)
 Xva = X_val_seq.reshape(len(X_val_seq), -1)
 Xte = X_test_seq.reshape(len(X_test_seq), -1)
@@ -704,10 +491,6 @@ for s in SENSORS:
     print(f"{s} -> MAE {100 * (1 - lstm_res[s]['mae'] / best_mae):+.1f}% (vs {best_mae_name}) | "
           f"RMSE {100 * (1 - lstm_res[s]['rmse'] / best_rmse):+.1f}% (vs {best_rmse_name})")
 
-# ---------------------------------------------------------------------------
-# Error diagnostics -- WHY a sensor scores lower. R2 is relative to each
-# sensor's own variance, so it is not comparable across sensors; RMSE/std is.
-# ---------------------------------------------------------------------------
 print("\nError diagnostics (final LSTM, test set):")
 for i, s in enumerate(SENSORS):
     err2 = (y_true[:, i] - y_pred_final[:, i]) ** 2
@@ -732,14 +515,6 @@ for sensor in SPECIALIST_SENSORS:
         others = "  ".join(f"{s.split('_')[-1]}={y_true[w, i]:.0f}" for i, s in enumerate(SENSORS))
         print(f"  {t} | {y_true[w, j]:7.1f} | {y_pred_final[w, j]:7.1f} | {persist_pred[w, j]:7.1f} | {others}")
 
-# ----------------------------------------------------------------------------
-# ----------------------------------------------------------------------------
-# 8. Run-level summary: which artifact "wins" for every sensor and how it
-#    scored on test, so results can be checked/compared later without
-#    retraining anything. Points at files already saved above -- the shared
-#    model + scalers right after fit(), any winning specialist inside the
-#    loop above.
-# ----------------------------------------------------------------------------
 training_summary = {
     "run_at": datetime.now(timezone.utc).isoformat(),
     "config": {"WINDOW": WINDOW, "HORIZON": HORIZON, "SEED": SEED},
@@ -771,12 +546,3 @@ print(f"\nSaved run summary -> {summary_path}")
 print("Per-sensor winning artifact:")
 for s in SENSORS:
     print(f"  {s}: {chosen_candidate[s]} -> {training_summary['sensors'][s]['artifact']}")
-
-# Next steps if the LSTM doesn't clearly beat the baselines above:
-# - Check train_loss vs val_loss from the fit() log:
-#     close + both mediocre -> underfitting (more capacity / longer WINDOW)
-#     train << val, gap widening -> overfitting (cut hidden units first)
-# - Val and test are later, contiguous slices of the data, so they can cover
-#   different seasons than train. If val_loss stays well above train_loss, look
-#   at which months each split contains before changing the architecture.
-# ----------------------------------------------------------------------------
