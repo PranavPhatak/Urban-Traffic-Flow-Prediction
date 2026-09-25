@@ -49,6 +49,9 @@ FIXED in this version (the reason the baseline looked "too low"):
 """
 
 from pathlib import Path
+import json
+from datetime import datetime, timezone
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -62,6 +65,8 @@ from tensorflow.keras import layers, models, callbacks
 # Config
 # ----------------------------------------------------------------------------
 PROCESSED_DIR = Path("../dataset/processed")
+MODELS_DIR = Path("../models")
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
 SENSORS = ["GD0501_B", "GD0501_C", "GD0501_D"]
 HORIZON = 1          # hours ahead. MUST equal HORIZON in 02_feature_engineering.py
 WINDOW = 48          # hours of history fed to the LSTM per prediction
@@ -249,6 +254,22 @@ history = model.fit(
 )
 
 # ----------------------------------------------------------------------------
+# 6b. Persist the shared model + scalers now. EarlyStopping above used
+#     restore_best_weights=True, so `model` already holds the weights from
+#     its best-val-loss epoch, not the last epoch trained -- saving here
+#     captures exactly that checkpoint. B and C have no other candidate model
+#     (SPECIALIST_SENSORS never touches them), so this file IS their final
+#     saved model; for D it's also the "multi-output" candidate in the
+#     selection below.
+# ----------------------------------------------------------------------------
+SHARED_MODEL_PATH = MODELS_DIR / "shared_multioutput_lstm.keras"
+model.save(SHARED_MODEL_PATH)
+joblib.dump(feature_scaler, MODELS_DIR / "feature_scaler.pkl")
+joblib.dump(target_scaler, MODELS_DIR / "target_scaler.pkl")
+print(f"\nSaved shared multi-output model (best val_loss checkpoint) -> {SHARED_MODEL_PATH}")
+print(f"Saved feature/target scalers -> {MODELS_DIR}")
+
+# ----------------------------------------------------------------------------
 # 7. Evaluate everything on the SAME test windows, in real vehicles/hour
 # ----------------------------------------------------------------------------
 def evaluate(label, y_true, y_pred):
@@ -384,6 +405,7 @@ def neighbor_divergence_window(sensor, split_raw, end_idx):
 
 
 divergence_window = {}
+div_stats = {}   # sensor -> (mean, std), kept so the winning model's manifest can record them
 for sensor in SPECIALIST_SENSORS:
     divergence_window[sensor] = {
         "train": neighbor_divergence_window(sensor, train_raw, train_end_idx),
@@ -393,6 +415,7 @@ for sensor in SPECIALIST_SENSORS:
     # Standardize using TRAIN stats only, same discipline as feature_scaler.
     div_mean = divergence_window[sensor]["train"].mean()
     div_std = divergence_window[sensor]["train"].std() + 1e-8
+    div_stats[sensor] = (float(div_mean), float(div_std))
     for split in ("train", "val", "test"):
         divergence_window[sensor][split] = (divergence_window[sensor][split] - div_mean) / div_std
 
@@ -473,22 +496,115 @@ y_val_true = np.expm1(target_scaler.inverse_transform(y_val_seq))
 val_pred_scaled = model.predict(X_val_seq, verbose=0)
 y_pred_final = y_pred.copy()          # B/C columns are never modified
 
+# winning candidate name per sensor; defaults to "multi-output" for sensors
+# with no specialist (B, C) -- they only ever have the one shared model.
+chosen_candidate = {s: "multi-output" for s in SENSORS}
+
+# sensor -> variant name -> {"seed_models": [...], "residual": bool, "use_divergence": bool}
+# Populated as each specialist variant trains, so the winning one(s) can be
+# saved to disk below WITHOUT retraining anything.
+trained_models = {}
+
+# blend-* candidates are equal-weight means of two named base variants;
+# "ensemble" (handled separately below, via `members`) is an equal-weight
+# mean of every candidate trained so far. Both need to be expanded down to
+# actual trained models before anything can be saved.
+COMPOSITE_MAP = {
+    "blend-huber": ["weighted-huber", "residual-huber"],
+    "blend-huber-div": ["weighted-huber-div", "residual-huber-div"],
+}
+
+
+def expand_candidate(name, ensemble_members):
+    """Flatten a (possibly composite) candidate name into {leaf: weight},
+    where each leaf is either 'multi-output' or a SPECIALIST_VARIANTS name
+    with an actual trained model. Composite weights multiply through
+    recursively (blend-huber inside ensemble still gets the right share)."""
+    if name == "ensemble":
+        subs = ensemble_members
+    elif name in COMPOSITE_MAP:
+        subs = COMPOSITE_MAP[name]
+    else:
+        return {name: 1.0}
+    share = 1.0 / len(subs)
+    result = {}
+    for s in subs:
+        for leaf, w in expand_candidate(s, ensemble_members).items():
+            result[leaf] = result.get(leaf, 0.0) + w * share
+    return result
+
+
+def save_best_specialist(sensor, best_name, ensemble_members, val_rmse_map, veh_test_map, y_true_col, j):
+    """Save exactly the trained model(s) the winning candidate for `sensor`
+    needs -- nothing else -- plus a manifest recording how to recombine them
+    and which preprocessing stats inference must reapply. Not called when
+    best_name == 'multi-output': that model is already saved as
+    SHARED_MODEL_PATH above."""
+    leaves = expand_candidate(best_name, ensemble_members)
+    sensor_dir = MODELS_DIR / "specialists" / sensor
+    sensor_dir.mkdir(parents=True, exist_ok=True)
+
+    components, needs_residual, needs_divergence = [], False, False
+    for leaf, weight in leaves.items():
+        if leaf == "multi-output":
+            components.append({"leaf": "multi-output", "weight": weight, "seed_model_paths": []})
+            continue
+        info = trained_models[sensor][leaf]
+        needs_residual = needs_residual or info["residual"]
+        needs_divergence = needs_divergence or info["use_divergence"]
+        seed_paths = []
+        for k, seed_model in enumerate(info["seed_models"]):
+            path = sensor_dir / f"{leaf}__seed{k}.keras"
+            seed_model.save(path)
+            seed_paths.append(str(path.relative_to(MODELS_DIR)))
+        components.append({
+            "leaf": leaf, "weight": weight, "seed_model_paths": seed_paths,
+            "residual": info["residual"], "use_divergence": info["use_divergence"],
+        })
+
+    err = y_true_col - veh_test_map[best_name]
+    manifest = {
+        "sensor": sensor,
+        "selected_candidate": best_name,
+        "val_rmse": float(val_rmse_map[best_name]),
+        "test_rmse": float(np.sqrt(np.mean(err ** 2))),
+        "test_mae": float(np.mean(np.abs(err))),
+        "test_r2": float(r2_score(y_true_col, veh_test_map[best_name])),
+        "components": components,
+        "window": WINDOW,
+        "horizon": HORIZON,
+        "feature_cols": FEATURE_COLS,
+        "residual_stats": {"mean": float(res_mean[j]), "std": float(res_std[j])} if needs_residual else None,
+        "divergence_stats": (
+            {"mean": div_stats[sensor][0], "std": div_stats[sensor][1]} if needs_divergence else None
+        ),
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(sensor_dir / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Saved winning '{best_name}' model(s) for {sensor} -> {sensor_dir}")
+
+
 for sensor in SPECIALIST_SENSORS:
     j = SENSORS.index(sensor)
     print(f"\nDedicated models for {sensor}:")
     veh_val = {"multi-output": scaled_to_vehicles(val_pred_scaled[:, j], j)}
     veh_test = {"multi-output": scaled_to_vehicles(y_pred_scaled[:, j], j)}
+    trained_models[sensor] = {}
     for name, weighted, huber, residual, offset, n_seeds, use_divergence in SPECIALIST_VARIANTS:
         Xva_pred = augmented_inputs(sensor, "val", use_divergence)
         Xte_pred = augmented_inputs(sensor, "test", use_divergence)
-        pv, pt = [], []
+        pv, pt, seed_models = [], [], []
         for k in range(n_seeds):
             m = fit_specialist(j, sensor, weighted, huber, residual, SEED + offset + k, use_divergence)
             pv.append(to_vehicles(m.predict(Xva_pred, verbose=0)[:, 0], j, "val", residual))
             pt.append(to_vehicles(m.predict(Xte_pred, verbose=0)[:, 0], j, "test", residual))
-            del m
+            seed_models.append(m)   # kept (not deleted) so the winning variant can be saved below
         veh_val[name] = np.mean(pv, axis=0)
         veh_test[name] = np.mean(pt, axis=0)
+        trained_models[sensor][name] = {
+            "seed_models": seed_models, "residual": residual, "use_divergence": use_divergence,
+        }
     members = list(veh_val)
     veh_val["blend-huber"] = np.mean([veh_val["weighted-huber"], veh_val["residual-huber"]], axis=0)
     veh_test["blend-huber"] = np.mean([veh_test["weighted-huber"], veh_test["residual-huber"]], axis=0)
@@ -511,6 +627,12 @@ for sensor in SPECIALIST_SENSORS:
     best = min(val_rmse, key=val_rmse.get)
     print(f"-> selected for {sensor}: {best}")
     y_pred_final[:, j] = veh_test[best]
+    chosen_candidate[sensor] = best
+
+    if best == "multi-output":
+        print(f"No extra artifact needed for {sensor}: the winner is the shared model, already saved.")
+    else:
+        save_best_specialist(sensor, best, members, val_rmse, veh_test, y_true[:, j], j)
 
 # ---------------------------------------------------------------------------
 # Baselines. Every one is scored on the same test windows (test_end) as the
@@ -611,6 +733,45 @@ for sensor in SPECIALIST_SENSORS:
         print(f"  {t} | {y_true[w, j]:7.1f} | {y_pred_final[w, j]:7.1f} | {persist_pred[w, j]:7.1f} | {others}")
 
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 8. Run-level summary: which artifact "wins" for every sensor and how it
+#    scored on test, so results can be checked/compared later without
+#    retraining anything. Points at files already saved above -- the shared
+#    model + scalers right after fit(), any winning specialist inside the
+#    loop above.
+# ----------------------------------------------------------------------------
+training_summary = {
+    "run_at": datetime.now(timezone.utc).isoformat(),
+    "config": {"WINDOW": WINDOW, "HORIZON": HORIZON, "SEED": SEED},
+    "shared_model_path": str(SHARED_MODEL_PATH.relative_to(MODELS_DIR)),
+    "feature_scaler_path": "feature_scaler.pkl",
+    "target_scaler_path": "target_scaler.pkl",
+    "sensors": {},
+}
+for s in SENSORS:
+    winner = chosen_candidate[s]
+    training_summary["sensors"][s] = {
+        "winning_candidate": winner,
+        "test_mae": lstm_res[s]["mae"],
+        "test_rmse": lstm_res[s]["rmse"],
+        "test_r2": lstm_res[s]["r2"],
+        "test_wape": lstm_res[s]["wape"],
+        "artifact": (
+            str(SHARED_MODEL_PATH.relative_to(MODELS_DIR)) if winner == "multi-output"
+            else str((MODELS_DIR / "specialists" / s / "manifest.json").relative_to(MODELS_DIR))
+        ),
+    }
+training_summary["baselines"] = baseline_res
+
+summary_path = MODELS_DIR / "training_summary.json"
+with open(summary_path, "w") as f:
+    json.dump(training_summary, f, indent=2)
+
+print(f"\nSaved run summary -> {summary_path}")
+print("Per-sensor winning artifact:")
+for s in SENSORS:
+    print(f"  {s}: {chosen_candidate[s]} -> {training_summary['sensors'][s]['artifact']}")
+
 # Next steps if the LSTM doesn't clearly beat the baselines above:
 # - Check train_loss vs val_loss from the fit() log:
 #     close + both mediocre -> underfitting (more capacity / longer WINDOW)

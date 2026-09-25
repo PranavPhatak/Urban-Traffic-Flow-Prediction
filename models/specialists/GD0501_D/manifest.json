@@ -1,0 +1,58 @@
+{
+  "sensor": "GD0501_D",
+  "selected_candidate": "blend-huber",
+  "val_rmse": 6.9918557232514384,
+  "test_rmse": 9.207926090129337,
+  "test_mae": 5.637655735775564,
+  "test_r2": 0.8951703190911586,
+  "components": [
+    {
+      "leaf": "weighted-huber",
+      "weight": 0.5,
+      "seed_model_paths": [
+        "specialists\\GD0501_D\\weighted-huber__seed0.keras",
+        "specialists\\GD0501_D\\weighted-huber__seed1.keras",
+        "specialists\\GD0501_D\\weighted-huber__seed2.keras"
+      ],
+      "residual": false,
+      "use_divergence": false
+    },
+    {
+      "leaf": "residual-huber",
+      "weight": 0.5,
+      "seed_model_paths": [
+        "specialists\\GD0501_D\\residual-huber__seed0.keras",
+        "specialists\\GD0501_D\\residual-huber__seed1.keras",
+        "specialists\\GD0501_D\\residual-huber__seed2.keras"
+      ],
+      "residual": true,
+      "use_divergence": false
+    }
+  ],
+  "window": 48,
+  "horizon": 1,
+  "feature_cols": [
+    "GD0501_B",
+    "GD0501_C",
+    "GD0501_D",
+    "GD0501_B_rolling_std_24",
+    "GD0501_C_rolling_std_24",
+    "GD0501_D_rolling_std_24",
+    "GD0501_B_neighbor_mean",
+    "GD0501_C_neighbor_mean",
+    "GD0501_D_neighbor_mean",
+    "hour_sin",
+    "hour_cos",
+    "day_sin",
+    "day_cos",
+    "month_sin",
+    "month_cos",
+    "is_weekend"
+  ],
+  "residual_stats": {
+    "mean": -0.0009151593500494944,
+    "std": 0.6014227154971051
+  },
+  "divergence_stats": null,
+  "saved_at": "2026-09-25T10:54:58.410042+00:00"
+}

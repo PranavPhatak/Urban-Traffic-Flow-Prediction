@@ -6,3 +6,7 @@ scikit-learn
 pandas
 ipykernel
 statsmodels
+fastapi
+uvicorn
+pydantic
+streamlit
