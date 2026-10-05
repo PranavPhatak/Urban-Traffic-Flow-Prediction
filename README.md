@@ -426,4 +426,4 @@ Interactive API docs: `http://localhost:8000/docs`
 
 ## Author
 
-**Pranav** — Final-year Computer Engineering, NMIMS MPSTME · AI/ML & Cybersecurity
+Built by Pranav — Computer Engineering, NMIMS MPSTME.
