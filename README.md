@@ -426,4 +426,4 @@ Interactive API docs: `http://localhost:8000/docs`
 
 ## Author
 
-Built by Pranav — Computer Engineering, NMIMS MPSTME.
+*Built by Pranav — Computer Engineering, NMIMS MPSTME.*
