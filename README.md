@@ -18,7 +18,7 @@
 5. [Feature Engineering](#5-feature-engineering)
 6. [Modeling](#6-modeling)
 7. [Evaluation Methodology](#7-evaluation-methodology)
-8. [Serving: REST API](#8-serving-rest-api)
+8. [Serving: FAST API](#8-serving-fast-api)
 9. [Web App](#9-web-app)
 10. [Quickstart](#10-quickstart)
 11. [Configuration Reference](#11-configuration-reference)
@@ -294,7 +294,7 @@ The script prints the **LSTM improvement vs. the strongest baseline per sensor**
 
 ---
 
-## 8. Serving: REST API
+## 8. Serving: FAST API
 
 **File:** `api.py` (FastAPI)
 
